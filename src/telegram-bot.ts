@@ -11,12 +11,22 @@ import type { Config } from './config.js';
 
 const execAsync = promisify(exec);
 
+interface TelegramPhotoSize {
+  file_id: string;
+  file_unique_id: string;
+  width: number;
+  height: number;
+  file_size?: number;
+}
+
 interface TelegramMessage {
   message_id: number;
   from?: { id: number; first_name?: string; username?: string };
   chat: { id: number; type: string };
   date: number;
   text?: string;
+  caption?: string;
+  photo?: TelegramPhotoSize[];
 }
 
 interface TelegramUpdate {
@@ -66,6 +76,27 @@ class TelegramBot {
     }
     for (const chunk of chunks) {
       await this.apiPost('sendMessage', { chat_id: chatId, text: chunk });
+    }
+  }
+
+  async getFile(fileId: string): Promise<string | null> {
+    try {
+      const data = await this.apiGet(`getFile?file_id=${fileId}`);
+      if (data.ok && data.result.file_path) {
+        return `https://api.telegram.org/file/bot${this.token}/${data.result.file_path}`;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  async downloadFile(fileUrl: string, destPath: string): Promise<boolean> {
+    try {
+      await execAsync(`curl -s -o '${destPath}' '${fileUrl}'`, { timeout: 30000 });
+      return true;
+    } catch {
+      return false;
     }
   }
 
@@ -226,6 +257,10 @@ export function startTelegramBot(config: Config, tasks: TaskDefinition[]): Teleg
   fs.mkdirSync(logDir, { recursive: true });
   fs.mkdirSync(baseMemoryDir, { recursive: true });
 
+  // Directory for downloaded images
+  const imagesDir = path.join(baseMemoryDir, 'images');
+  fs.mkdirSync(imagesDir, { recursive: true });
+
   // Load system prompt template
   let systemPromptTemplate: string | undefined;
   if (config.memory?.enabled && config.memory.systemPromptFile) {
@@ -237,9 +272,22 @@ export function startTelegramBot(config: Config, tasks: TaskDefinition[]): Teleg
     }
   }
 
-  function getSystemPrompt(chatId: number): string | undefined {
-    if (!systemPromptTemplate) return undefined;
-    return systemPromptTemplate.replace(/\{chatId\}/g, String(chatId));
+  function getSystemPrompt(chatId: number): string {
+    const now = new Date();
+    const currentDateTime = now.toLocaleString('ko-KR', {
+      timeZone: 'Asia/Seoul',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      weekday: 'long',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false
+    });
+    const timeInfo = `[현재 시간: ${currentDateTime} (KST)]\n\n`;
+
+    if (!systemPromptTemplate) return timeInfo;
+    return timeInfo + systemPromptTemplate.replace(/\{chatId\}/g, String(chatId));
   }
 
   function logConversation(chatId: number, prompt: string, result: any): void {
@@ -284,25 +332,46 @@ export function startTelegramBot(config: Config, tasks: TaskDefinition[]): Teleg
 
 `;
 
+    // Progress message tracking (debounced)
+    let lastProgressTime = 0;
+    const progressDebounce = 3000; // 3초마다 최대 1개 메시지
+    const onProgress = async (message: string) => {
+      const now = Date.now();
+      if (now - lastProgressTime > progressDebounce) {
+        lastProgressTime = now;
+        try {
+          await bot.sendMessage(chatId, message);
+        } catch (err) {
+          console.error('[progress] Failed to send:', err);
+        }
+      }
+    };
+
     let result = await executeClaudeTask(
       {
         prompt: memoryPrefix + prompt,
         workdir: config.telegramBot.defaultWorkdir,
         systemPrompt: getSystemPrompt(chatId),
         sessionId: existingSessionId || undefined,
+        onProgress,
       },
       config.claude
     );
 
-    // If resume failed (stale session), retry without session
-    if (!result.success && existingSessionId && result.output.includes('No conversation found')) {
-      console.log(`[resume] Stale session for ${chatId}, retrying without resume`);
+    // If resume failed (stale session or auth error), retry without session
+    // DO NOT send error to user - silently retry
+    const sessionErrors = ['no conversation found', 'invalid api key', 'session', 'resume'];
+    const outputLower = (result.output || '').toLowerCase() + (result.error || '').toLowerCase();
+    const isSessionError = sessionErrors.some(err => outputLower.includes(err));
+    if (!result.success && existingSessionId && isSessionError) {
+      console.log(`[resume] Session error for ${chatId}, retrying without resume:`, result.output?.slice(0, 100));
       sessionStore.clearSession(String(chatId));
       result = await executeClaudeTask(
         {
-          prompt,
+          prompt: memoryPrefix + prompt,
           workdir: config.telegramBot.defaultWorkdir,
           systemPrompt: getSystemPrompt(chatId),
+          onProgress,
         },
         config.claude
       );
@@ -337,8 +406,47 @@ export function startTelegramBot(config: Config, tasks: TaskDefinition[]): Teleg
   async function handleMessage(msg: TelegramMessage): Promise<void> {
     const chatId = msg.chat.id;
     const text = msg.text;
+    const caption = msg.caption;
+    const photo = msg.photo;
 
-    if (!text || !isAuthorized(chatId)) return;
+    if (!isAuthorized(chatId)) return;
+
+    // Handle photo messages
+    if (photo && photo.length > 0) {
+      chatQueue.enqueue(chatId, async () => {
+        // Get the largest photo (last in array)
+        const largestPhoto = photo[photo.length - 1];
+        const fileUrl = await bot.getFile(largestPhoto.file_id);
+
+        if (!fileUrl) {
+          await bot.sendMessage(chatId, '이미지를 가져오는 데 실패했어요 😢');
+          return;
+        }
+
+        // Download image to local path
+        const fileName = `${chatId}_${Date.now()}.jpg`;
+        const localPath = path.join(imagesDir, fileName);
+        const downloaded = await bot.downloadFile(fileUrl, localPath);
+
+        if (!downloaded) {
+          await bot.sendMessage(chatId, '이미지 다운로드에 실패했어요 😢');
+          return;
+        }
+
+        // Build prompt with image reference
+        const userPrompt = caption || '이 이미지를 분석해줘';
+        const imagePrompt = `[이미지 분석 요청]
+이미지 경로: ${localPath}
+사용자 메시지: ${userPrompt}
+
+위 경로의 이미지를 Read 도구로 읽어서 분석해줘.`;
+
+        await handlePrompt(chatId, imagePrompt);
+      });
+      return;
+    }
+
+    if (!text) return;
 
     // Commands that are quick - run directly
     if (text === '/new' || text.startsWith('/new ')) {

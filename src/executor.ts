@@ -1,8 +1,5 @@
-import { exec } from 'node:child_process';
-import { promisify } from 'node:util';
+import { spawn } from 'node:child_process';
 import type { ClaudeConfig } from './config.js';
-
-const execAsync = promisify(exec);
 
 export interface ExecutorOptions {
   prompt: string;
@@ -11,6 +8,7 @@ export interface ExecutorOptions {
   sessionId?: string;
   allowedTools?: string[];
   systemPrompt?: string;
+  onProgress?: (message: string) => void;
 }
 
 export interface ExecutionResult {
@@ -24,6 +22,16 @@ function escapeShellArg(arg: string): string {
   return "'" + arg.replace(/'/g, "'\\''") + "'";
 }
 
+interface StreamEvent {
+  type: string;
+  message?: string;
+  content?: Array<{ type: string; text?: string }>;
+  result?: string;
+  session_id?: string;
+  is_error?: boolean;
+  subtype?: string;
+}
+
 export async function executeClaudeTask(
   options: ExecutorOptions,
   config: ClaudeConfig
@@ -33,82 +41,184 @@ export async function executeClaudeTask(
     workdir,
     timeout = config.defaultTimeout || 300000,
     sessionId,
-    allowedTools = config.allowedTools || ['Bash', 'Read', 'Glob', 'Grep'],
+    allowedTools = config.allowedTools || ['Bash', 'Read', 'Write', 'Glob', 'Grep'],
+    onProgress,
   } = options;
 
-  let cmd = config.binary;
+  const args: string[] = [];
 
   if (sessionId) {
-    cmd += ` --resume ${escapeShellArg(sessionId)}`;
+    args.push('--resume', sessionId);
   }
 
   if (options.systemPrompt) {
-    cmd += ` --system-prompt ${escapeShellArg(options.systemPrompt)}`;
+    args.push('--system-prompt', options.systemPrompt);
   }
 
-  cmd += ` -p ${escapeShellArg(prompt)}`;
-  cmd += ` --output-format ${config.outputFormat || 'json'}`;
-  cmd += ` --allowedTools ${escapeShellArg(allowedTools.join(','))}`;
+  args.push('-p', prompt);
+  args.push('--output-format', 'stream-json');
+  args.push('--verbose');
+  args.push('--allowedTools', allowedTools.join(','));
 
   if (config.extraArgs) {
-    cmd += ` ${config.extraArgs.join(' ')}`;
+    args.push(...config.extraArgs);
   }
 
-  cmd += ` < /dev/null`;
-
-  try {
-    const { stdout } = await execAsync(cmd, {
+  return new Promise((resolve) => {
+    const child = spawn(config.binary, args, {
       cwd: workdir,
-      timeout,
-      maxBuffer: 10 * 1024 * 1024,
       env: {
         ...process.env,
-        CLAUDE_CONFIG_DIR: process.env.CLAUDE_CRON_CONFIG_DIR || `${process.env.HOME}/.claude-telegram`,
+        ...(process.env.CLAUDE_CRON_CONFIG_DIR && {
+          CLAUDE_CONFIG_DIR: process.env.CLAUDE_CRON_CONFIG_DIR,
+        }),
       },
+      stdio: ['pipe', 'pipe', 'pipe'],
     });
 
-    let parsedOutput: any;
+    // Close stdin immediately
+    child.stdin.end();
+
+    let finalResult = '';
     let extractedSessionId = sessionId || '';
+    let isError = false;
+    let lastAssistantMessage = '';
+    let buffer = '';
 
-    try {
-      parsedOutput = JSON.parse(stdout);
-      if (parsedOutput.session_id) {
-        extractedSessionId = parsedOutput.session_id;
-      } else if (parsedOutput.sessionId) {
-        extractedSessionId = parsedOutput.sessionId;
+    const timeoutId = setTimeout(() => {
+      child.kill('SIGTERM');
+      resolve({
+        output: 'Timeout: 작업이 시간 내에 완료되지 않았습니다.',
+        sessionId: extractedSessionId,
+        success: false,
+        error: 'Timeout',
+      });
+    }, timeout);
+
+    child.stdout.on('data', (data: Buffer) => {
+      buffer += data.toString();
+
+      // Process complete lines
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || ''; // Keep incomplete line in buffer
+
+      for (const line of lines) {
+        if (!line.trim()) continue;
+
+        try {
+          const event: StreamEvent = JSON.parse(line);
+
+          // Extract session ID
+          if (event.session_id) {
+            extractedSessionId = event.session_id;
+          }
+
+          // Handle different event types
+          switch (event.type) {
+            case 'assistant':
+              // Assistant's text message - send progress update
+              if (event.message && onProgress) {
+                lastAssistantMessage = event.message;
+                // Only send meaningful messages (not just tool preparations)
+                if (event.message.length > 20 && !event.message.startsWith('[')) {
+                  onProgress(`💭 ${event.message.slice(0, 200)}${event.message.length > 200 ? '...' : ''}`);
+                }
+              }
+              // Also check content array
+              if (event.content) {
+                for (const block of event.content) {
+                  if (block.type === 'text' && block.text) {
+                    lastAssistantMessage = block.text;
+                    if (onProgress && block.text.length > 20) {
+                      onProgress(`💭 ${block.text.slice(0, 200)}${block.text.length > 200 ? '...' : ''}`);
+                    }
+                  }
+                }
+              }
+              break;
+
+            case 'tool_use':
+              // Tool being used - can notify for important tools
+              break;
+
+            case 'result':
+              // Final result
+              finalResult = event.result || lastAssistantMessage || '';
+              isError = event.is_error === true;
+              if (event.subtype === 'error_tool_use') {
+                isError = true;
+              }
+              break;
+
+            case 'error':
+              isError = true;
+              finalResult = event.message || 'Unknown error';
+              break;
+          }
+        } catch {
+          // Not JSON, might be raw output or error
+          if (line.includes('Invalid API key') || line.includes('No conversation found')) {
+            // Session/auth error - will be handled by retry logic
+            isError = true;
+            finalResult = line;
+          }
+        }
       }
-    } catch {
-      parsedOutput = { rawOutput: stdout };
-    }
+    });
 
-    const output =
-      typeof parsedOutput === 'string'
-        ? parsedOutput
-        : parsedOutput.result || parsedOutput.rawOutput || JSON.stringify(parsedOutput, null, 2);
+    let stderrOutput = '';
+    child.stderr.on('data', (data: Buffer) => {
+      stderrOutput += data.toString();
+    });
 
-    return { output, sessionId: extractedSessionId, success: true };
-  } catch (error: any) {
-    const stdout = error.stdout || '';
-    if (stdout.trim()) {
-      try {
-        const parsed = JSON.parse(stdout);
-        const sid = parsed.session_id || parsed.sessionId || sessionId || '';
-        const out = parsed.result || JSON.stringify(parsed, null, 2);
-        const isError = parsed.is_error === true;
-        return { output: out, sessionId: sid, success: !isError };
-      } catch {
-        // fall through
+    child.on('close', (code) => {
+      clearTimeout(timeoutId);
+
+      // Process any remaining buffer
+      if (buffer.trim()) {
+        try {
+          const event: StreamEvent = JSON.parse(buffer);
+          if (event.result) {
+            finalResult = event.result;
+          }
+          if (event.session_id) {
+            extractedSessionId = event.session_id;
+          }
+          if (event.is_error) {
+            isError = true;
+          }
+        } catch {
+          // Ignore parse errors for incomplete data
+        }
       }
-    }
-    console.error('[executor] Error:', error.message);
-    console.error('[executor] Code:', error.code);
-    console.error('[executor] Stderr:', error.stderr?.slice(0, 500));
-    console.error('[executor] Cmd:', cmd.slice(0, 200));
-    return {
-      output: error.stderr || error.message || 'Unknown error',
-      sessionId: sessionId || '',
-      success: false,
-      error: error.message,
-    };
-  }
+
+      // If no result but we have assistant message, use that
+      if (!finalResult && lastAssistantMessage) {
+        finalResult = lastAssistantMessage;
+      }
+
+      // Handle errors
+      if (code !== 0 && !finalResult) {
+        finalResult = stderrOutput || `Process exited with code ${code}`;
+        isError = true;
+      }
+
+      resolve({
+        output: finalResult || 'No response',
+        sessionId: extractedSessionId,
+        success: !isError && code === 0,
+        error: isError ? (stderrOutput || finalResult) : undefined,
+      });
+    });
+
+    child.on('error', (err) => {
+      clearTimeout(timeoutId);
+      resolve({
+        output: err.message,
+        sessionId: extractedSessionId,
+        success: false,
+        error: err.message,
+      });
+    });
+  });
 }
