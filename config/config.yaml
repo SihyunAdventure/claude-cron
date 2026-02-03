@@ -22,7 +22,7 @@ notifications:
 telegramBot:
   enabled: true
   allowedChatIds: ["${TELEGRAM_CHAT_ID}"]
-  defaultWorkdir: ~/Documents/Activate/claude-cron
+  defaultWorkdir: ~/Documents/01_Projects/dev/claude-cron
 
 heartbeat:
   enabled: false

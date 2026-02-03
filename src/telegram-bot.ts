@@ -156,12 +156,17 @@ function initUserMemory(baseMemoryDir: string, chatId: number): void {
   const userDir = getUserMemoryDir(baseMemoryDir, chatId);
 
   // Copy template files if they don't exist yet
+  // Templates are stored in memory/templates/ and copied to user-specific directories
   const templates: [string, string][] = [
-    ['bot/SOUL.md', 'bot/SOUL.md'],
-    ['bot/IDENTITY.md', 'bot/IDENTITY.md'],
-    ['user/USER.md', 'user/USER.md'],
-    ['user/MEMORY.md', 'user/MEMORY.md'],
+    ['templates/IDENTITY.md', 'bot/IDENTITY.md'],
+    ['templates/USER.md', 'user/USER.md'],
+    ['templates/MEMORY.md', 'user/MEMORY.md'],
+    ['templates/areas/work.md', 'areas/work.md'],
+    ['templates/areas/health.md', 'areas/health.md'],
   ];
+
+  // Ensure areas directory exists
+  fs.mkdirSync(path.join(userDir, 'areas'), { recursive: true });
 
   for (const [src, dest] of templates) {
     const destPath = path.join(userDir, dest);
@@ -268,8 +273,16 @@ export function startTelegramBot(config: Config, tasks: TaskDefinition[]): Teleg
     const existingSessionId = sessionStore.getSession(String(chatId));
     const userMemDir = getUserMemoryDir(baseMemoryDir, chatId);
     const remindersPath = path.resolve(config.telegramBot.defaultWorkdir || '.', 'config', 'reminders.json');
-    const memoryPrefix = `[메모리 경로: ${userMemDir}] 대화에서 사용자 정보(이름, 선호 등)가 나오면 ${userMemDir}/user/USER.md에, 봇 이름/성격이 정해지면 ${userMemDir}/bot/IDENTITY.md에, 중요 정보는 ${userMemDir}/user/MEMORY.md에 Write 도구로 즉시 기록하라.
-[알림 관리: ${remindersPath}] 알람/리마인더 등록·수정·삭제 요청 시 이 JSON 파일을 Read하고 Write로 수정하라. 형식: [{"id":"r-타임스탬프","chatId":${chatId},"type":"message"|"task","message":"내용","hour":시,"minute":분,"cron":"분 시 * * *","createdAt":"ISO"}]. type=task는 Claude가 실행, type=message는 단순 알림.\n\n`;
+    const memoryPrefix = `[메모리 시스템]
+경로: ${userMemDir}
+- 대화 시작 시: user/USER.md, user/MEMORY.md, bot/IDENTITY.md를 Read하여 맥락 파악
+- 사용자 정보(이름, 선호 등) → user/USER.md를 Read 후 업데이트
+- 기억 요청, 중요 정보 → user/MEMORY.md를 Read 후 append (덮어쓰기 금지)
+- 봇 이름/성격 설정 → bot/IDENTITY.md를 Read 후 업데이트
+- 업무/프로젝트 정보 → areas/work.md, 건강/운동 정보 → areas/health.md
+[알림 관리: ${remindersPath}] 알람/리마인더 등록·수정·삭제 요청 시 이 JSON 파일을 Read하고 Write로 수정하라. 형식: [{"id":"r-타임스탬프","chatId":${chatId},"type":"message"|"task","message":"내용","hour":시,"minute":분,"cron":"분 시 * * *","createdAt":"ISO"}]. type=task는 Claude가 실행, type=message는 단순 알림.
+
+`;
 
     let result = await executeClaudeTask(
       {

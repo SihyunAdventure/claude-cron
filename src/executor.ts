@@ -61,6 +61,10 @@ export async function executeClaudeTask(
       cwd: workdir,
       timeout,
       maxBuffer: 10 * 1024 * 1024,
+      env: {
+        ...process.env,
+        CLAUDE_CONFIG_DIR: process.env.CLAUDE_CRON_CONFIG_DIR || `${process.env.HOME}/.claude-telegram`,
+      },
     });
 
     let parsedOutput: any;
