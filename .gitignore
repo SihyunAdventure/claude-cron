@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Environment variables
+.env
+
+# Logs
+logs/
+
+# Sessions and state
+sessions/
+.omc/
+.playwright-mcp/
+
+# OS files
+.DS_Store
+
+# Memory (runtime data)
+memory/
+
+# Tasks (runtime data)
+tasks/

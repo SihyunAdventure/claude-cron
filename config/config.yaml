@@ -1,0 +1,42 @@
+claude:
+  binary: /opt/homebrew/bin/claude
+  model: claude-sonnet-4-20250514
+  maxTokens: 4096
+  defaultTimeout: 300000
+  outputFormat: json
+  allowedTools: ["Bash", "Read", "Write", "Glob", "Grep"]
+  extraArgs: []
+
+memory:
+  enabled: true
+  dir: ./memory
+  systemPromptFile: ./memory/system-prompt.md
+
+notifications:
+  telegram:
+    token: ${TELEGRAM_BOT_TOKEN}
+    chatId: ${TELEGRAM_CHAT_ID}
+  slack:
+    webhookUrl: ${SLACK_WEBHOOK_URL}
+
+telegramBot:
+  enabled: true
+  allowedChatIds: ["${TELEGRAM_CHAT_ID}"]
+  defaultWorkdir: ~/Documents/Activate/claude-cron
+
+heartbeat:
+  enabled: false
+  file: ./HEARTBEAT.md
+  cron: "*/10 * * * *"
+  activeHours:
+    start: "07:00"
+    end: "23:00"
+    timezone: "Asia/Seoul"
+
+sessions:
+  dir: ./sessions
+  ttlHours: 24
+
+logging:
+  dir: ./logs
+  retention: 30

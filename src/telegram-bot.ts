@@ -1,0 +1,437 @@
+import { exec } from 'node:child_process';
+import { promisify } from 'node:util';
+import fs from 'node:fs';
+import path from 'node:path';
+import { executeClaudeTask } from './executor.js';
+import { SessionStore } from './session-store.js';
+import { watch } from 'chokidar';
+import { ReminderManager, formatTime } from './reminders.js';
+import type { TaskDefinition } from './task-loader.js';
+import type { Config } from './config.js';
+
+const execAsync = promisify(exec);
+
+interface TelegramMessage {
+  message_id: number;
+  from?: { id: number; first_name?: string; username?: string };
+  chat: { id: number; type: string };
+  date: number;
+  text?: string;
+}
+
+interface TelegramUpdate {
+  update_id: number;
+  message?: TelegramMessage;
+}
+
+class TelegramBot {
+  private token: string;
+  private baseUrl: string;
+  private offset = 0;
+  private running = false;
+
+  constructor(token: string) {
+    this.token = token;
+    this.baseUrl = `https://api.telegram.org/bot${token}`;
+  }
+
+  async apiPost(endpoint: string, data: Record<string, unknown>): Promise<any> {
+    const url = `${this.baseUrl}/${endpoint}`;
+    const body = JSON.stringify(data).replace(/'/g, "'\\''");
+    const { stdout } = await execAsync(
+      `curl -s -X POST '${url}' -H 'Content-Type: application/json' -d '${body}'`,
+      { timeout: 30000 }
+    );
+    return JSON.parse(stdout);
+  }
+
+  private async apiGet(endpoint: string): Promise<any> {
+    const url = `${this.baseUrl}/${endpoint}`;
+    const { stdout } = await execAsync(
+      `curl -s --max-time 35 '${url}'`,
+      { timeout: 40000 }
+    );
+    return JSON.parse(stdout);
+  }
+
+  async sendMessage(chatId: number, text: string): Promise<void> {
+    const maxLen = 4096;
+    const chunks: string[] = [];
+    if (text.length <= maxLen) {
+      chunks.push(text);
+    } else {
+      for (let i = 0; i < text.length; i += maxLen) {
+        chunks.push(text.slice(i, i + maxLen));
+      }
+    }
+    for (const chunk of chunks) {
+      await this.apiPost('sendMessage', { chat_id: chatId, text: chunk });
+    }
+  }
+
+  async getUpdates(): Promise<TelegramUpdate[]> {
+    try {
+      const data = await this.apiGet(`getUpdates?offset=${this.offset}&timeout=30`);
+      if (data.ok && data.result.length > 0) {
+        this.offset = data.result[data.result.length - 1].update_id + 1;
+      }
+      return data.ok ? data.result : [];
+    } catch {
+      return [];
+    }
+  }
+
+  async startPolling(handler: (msg: TelegramMessage) => Promise<void>): Promise<void> {
+    this.running = true;
+    console.log('Telegram bot polling started');
+    while (this.running) {
+      const updates = await this.getUpdates();
+      for (const update of updates) {
+        if (update.message) {
+          handler(update.message).catch((error) => {
+            console.error('Message handler error:', error);
+          });
+        }
+      }
+    }
+  }
+
+  stop(): void {
+    this.running = false;
+  }
+}
+
+// Per-chatId queue: sequential within same user, parallel across users
+class ChatQueue {
+  private queues: Map<number, Array<() => Promise<void>>> = new Map();
+  private running: Set<number> = new Set();
+
+  enqueue(chatId: number, fn: () => Promise<void>): void {
+    if (!this.queues.has(chatId)) {
+      this.queues.set(chatId, []);
+    }
+    this.queues.get(chatId)!.push(fn);
+    this.process(chatId);
+  }
+
+  private async process(chatId: number): Promise<void> {
+    if (this.running.has(chatId)) return;
+    this.running.add(chatId);
+
+    const queue = this.queues.get(chatId)!;
+    while (queue.length > 0) {
+      const fn = queue.shift()!;
+      try {
+        await fn();
+      } catch (err) {
+        console.error(`[queue] Error for chat ${chatId}:`, err);
+      }
+    }
+
+    this.running.delete(chatId);
+  }
+}
+
+function getTodayDateStr(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function getTimeStr(): string {
+  return new Date().toTimeString().slice(0, 5);
+}
+
+/** Get user-specific memory directory */
+function getUserMemoryDir(baseMemoryDir: string, chatId: number): string {
+  const userDir = path.join(baseMemoryDir, String(chatId));
+  // Ensure all subdirs exist
+  fs.mkdirSync(path.join(userDir, 'bot'), { recursive: true });
+  fs.mkdirSync(path.join(userDir, 'user'), { recursive: true });
+  fs.mkdirSync(path.join(userDir, 'areas'), { recursive: true });
+  fs.mkdirSync(path.join(userDir, 'daily'), { recursive: true });
+  return userDir;
+}
+
+/** Initialize user memory from templates if first time */
+function initUserMemory(baseMemoryDir: string, chatId: number): void {
+  const userDir = getUserMemoryDir(baseMemoryDir, chatId);
+
+  // Copy template files if they don't exist yet
+  const templates: [string, string][] = [
+    ['bot/SOUL.md', 'bot/SOUL.md'],
+    ['bot/IDENTITY.md', 'bot/IDENTITY.md'],
+    ['user/USER.md', 'user/USER.md'],
+    ['user/MEMORY.md', 'user/MEMORY.md'],
+  ];
+
+  for (const [src, dest] of templates) {
+    const destPath = path.join(userDir, dest);
+    if (!fs.existsSync(destPath)) {
+      const srcPath = path.join(baseMemoryDir, src);
+      if (fs.existsSync(srcPath)) {
+        fs.copyFileSync(srcPath, destPath);
+      }
+    }
+  }
+}
+
+function appendDailyLog(userMemoryDir: string, prompt: string, response: string): void {
+  const dateStr = getTodayDateStr();
+  const logFile = path.join(userMemoryDir, 'daily', `${dateStr}.md`);
+  const time = getTimeStr();
+
+  const promptSummary = prompt.length > 100 ? prompt.slice(0, 100) + '...' : prompt;
+  const responseSummary = response.length > 100 ? response.slice(0, 100) + '...' : response;
+
+  let entry = '';
+  if (!fs.existsSync(logFile)) {
+    entry += `# ${dateStr} 대화 로그\n\n`;
+  }
+  entry += `- [${time}] 사용자: ${promptSummary}\n`;
+  entry += `- [${time}] Claude: ${responseSummary}\n\n`;
+
+  fs.appendFileSync(logFile, entry);
+}
+
+export function startTelegramBot(config: Config, tasks: TaskDefinition[]): TelegramBot {
+  if (!config.notifications.telegram?.token) {
+    throw new Error('Telegram bot token not configured');
+  }
+
+  const bot = new TelegramBot(config.notifications.telegram.token);
+  const sessionStore = new SessionStore({
+    dir: config.sessions.dir,
+    ttlHours: config.sessions.ttlHours,
+  });
+  const allowedChatIds = new Set(config.telegramBot.allowedChatIds);
+  const baseMemoryDir = config.memory?.dir || path.resolve(process.cwd(), 'memory');
+  const chatQueue = new ChatQueue();
+
+  function isAuthorized(chatId: number): boolean {
+    return allowedChatIds.has(String(chatId));
+  }
+
+  // Initialize reminder manager
+  const reminderMgr = new ReminderManager(
+    (chatId, text) => bot.sendMessage(chatId, text)
+  );
+  reminderMgr.setClaudeConfig(config.claude, config.telegramBot.defaultWorkdir);
+  reminderMgr.startAll();
+
+  const logDir = config.logging.dir;
+  fs.mkdirSync(logDir, { recursive: true });
+  fs.mkdirSync(baseMemoryDir, { recursive: true });
+
+  // Load system prompt template
+  let systemPromptTemplate: string | undefined;
+  if (config.memory?.enabled && config.memory.systemPromptFile) {
+    try {
+      systemPromptTemplate = fs.readFileSync(config.memory.systemPromptFile, 'utf-8');
+      console.log('System prompt loaded from', config.memory.systemPromptFile);
+    } catch {
+      console.warn('System prompt file not found:', config.memory.systemPromptFile);
+    }
+  }
+
+  function getSystemPrompt(chatId: number): string | undefined {
+    if (!systemPromptTemplate) return undefined;
+    return systemPromptTemplate.replace(/\{chatId\}/g, String(chatId));
+  }
+
+  function logConversation(chatId: number, prompt: string, result: any): void {
+    const logFile = path.join(logDir, `chat-${chatId}.jsonl`);
+    const entry = {
+      timestamp: new Date().toISOString(),
+      chatId,
+      prompt,
+      response: result.output,
+      sessionId: result.sessionId,
+      success: result.success,
+    };
+    fs.appendFileSync(logFile, JSON.stringify(entry) + '\n');
+  }
+
+  async function sendTyping(chatId: number): Promise<NodeJS.Timeout> {
+    const send = () => bot.apiPost('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
+    send();
+    return setInterval(send, 4000);
+  }
+
+  async function handlePrompt(chatId: number, prompt: string): Promise<void> {
+    const typingInterval = await sendTyping(chatId);
+
+    // Initialize per-user memory
+    if (config.memory?.enabled) {
+      initUserMemory(baseMemoryDir, chatId);
+    }
+
+    // Get existing session for --resume
+    const existingSessionId = sessionStore.getSession(String(chatId));
+    const userMemDir = getUserMemoryDir(baseMemoryDir, chatId);
+    const remindersPath = path.resolve(config.telegramBot.defaultWorkdir || '.', 'config', 'reminders.json');
+    const memoryPrefix = `[메모리 경로: ${userMemDir}] 대화에서 사용자 정보(이름, 선호 등)가 나오면 ${userMemDir}/user/USER.md에, 봇 이름/성격이 정해지면 ${userMemDir}/bot/IDENTITY.md에, 중요 정보는 ${userMemDir}/user/MEMORY.md에 Write 도구로 즉시 기록하라.
+[알림 관리: ${remindersPath}] 알람/리마인더 등록·수정·삭제 요청 시 이 JSON 파일을 Read하고 Write로 수정하라. 형식: [{"id":"r-타임스탬프","chatId":${chatId},"type":"message"|"task","message":"내용","hour":시,"minute":분,"cron":"분 시 * * *","createdAt":"ISO"}]. type=task는 Claude가 실행, type=message는 단순 알림.\n\n`;
+
+    let result = await executeClaudeTask(
+      {
+        prompt: memoryPrefix + prompt,
+        workdir: config.telegramBot.defaultWorkdir,
+        systemPrompt: getSystemPrompt(chatId),
+        sessionId: existingSessionId || undefined,
+      },
+      config.claude
+    );
+
+    // If resume failed (stale session), retry without session
+    if (!result.success && existingSessionId && result.output.includes('No conversation found')) {
+      console.log(`[resume] Stale session for ${chatId}, retrying without resume`);
+      sessionStore.clearSession(String(chatId));
+      result = await executeClaudeTask(
+        {
+          prompt,
+          workdir: config.telegramBot.defaultWorkdir,
+          systemPrompt: getSystemPrompt(chatId),
+        },
+        config.claude
+      );
+    }
+
+    clearInterval(typingInterval);
+
+    // Save session ID for future --resume
+    if (result.sessionId) {
+      sessionStore.setSession(String(chatId), result.sessionId);
+    }
+
+    logConversation(chatId, prompt, result);
+
+    // Append to daily memory log (per-user)
+    if (config.memory?.enabled) {
+      try {
+        const userMemDir = getUserMemoryDir(baseMemoryDir, chatId);
+        appendDailyLog(userMemDir, prompt, result.output);
+      } catch (err) {
+        console.error('Failed to append daily log:', err);
+      }
+    }
+
+    if (result.success) {
+      await bot.sendMessage(chatId, result.output);
+    } else {
+      await bot.sendMessage(chatId, `오류: ${result.output}`);
+    }
+  }
+
+  async function handleMessage(msg: TelegramMessage): Promise<void> {
+    const chatId = msg.chat.id;
+    const text = msg.text;
+
+    if (!text || !isAuthorized(chatId)) return;
+
+    // Commands that are quick - run directly
+    if (text === '/new' || text.startsWith('/new ')) {
+      sessionStore.clearSession(String(chatId));
+      await bot.sendMessage(chatId, '새 대화를 시작합니다.');
+      return;
+    }
+
+    if (text === '/tasks' || text.startsWith('/tasks ')) {
+      if (tasks.length === 0) {
+        await bot.sendMessage(chatId, '등록된 태스크 없음');
+        return;
+      }
+      const list = tasks
+        .map((t) => `- ${t.id} [${t.cron}]: ${t.prompt.slice(0, 80)}...`)
+        .join('\n');
+      await bot.sendMessage(chatId, `등록된 태스크:\n${list}`);
+      return;
+    }
+
+    if (text === '/status' || text.startsWith('/status ')) {
+      const sessionId = sessionStore.getSession(String(chatId));
+      const status = sessionId
+        ? `활성 세션: ${sessionId.slice(0, 12)}...`
+        : '활성 세션 없음';
+      await bot.sendMessage(chatId, status);
+      return;
+    }
+
+    if (text === '/alarms' || text.startsWith('/alarms ')) {
+      const list = reminderMgr.list(chatId);
+      if (list.length === 0) {
+        await bot.sendMessage(chatId, '등록된 알람이 없어요.');
+        return;
+      }
+      const lines = list.map((r, i) => {
+        const icon = r.type === 'task' ? '🔄' : '⏰';
+        return `${i + 1}. ${icon} ${formatTime(r.hour, r.minute)} - ${r.message}`;
+      });
+      await bot.sendMessage(chatId, `등록된 알람:\n${lines.join('\n')}`);
+      return;
+    }
+
+    if (text.startsWith('/delalarm')) {
+      const arg = text.replace(/^\/delalarm\s*/, '').trim();
+      if (!arg) {
+        await bot.sendMessage(chatId, '사용법: /delalarm <번호> (/alarms에서 확인)');
+        return;
+      }
+      const ok = reminderMgr.remove(chatId, arg);
+      await bot.sendMessage(chatId, ok ? '알람을 삭제했어요.' : '해당 알람을 찾지 못했어요.');
+      return;
+    }
+
+    if (text === '/start') {
+      await bot.sendMessage(chatId, 'Claude Cron Bot\n\n/ask <질문> - Claude에게 질문\n/alarm <시간+내용> - 알람 등록\n/alarms - 알람 목록\n/delalarm <번호> - 알람 삭제\n/run <task-id> - 태스크 실행\n/tasks - 태스크 목록\n/new - 새 대화\n/status - 세션 상태\n\n또는 그냥 메시지를 보내세요.');
+      return;
+    }
+
+    // Commands that call Claude - enqueue per chatId
+    chatQueue.enqueue(chatId, async () => {
+      if (text.startsWith('/run')) {
+        const taskId = text.replace(/^\/run\s*/, '').trim();
+        if (!taskId) {
+          await bot.sendMessage(chatId, '사용법: /run <task-id>');
+          return;
+        }
+        const task = tasks.find((t) => t.id === taskId);
+        if (!task) {
+          const ids = tasks.map((t) => t.id).join(', ');
+          await bot.sendMessage(chatId, `태스크 없음: ${taskId}\n등록된 태스크: ${ids}`);
+          return;
+        }
+        await bot.sendMessage(chatId, `태스크 실행 중: ${taskId}`);
+        const result = await executeClaudeTask(
+          { prompt: task.prompt, workdir: task.workdir, timeout: task.timeout },
+          config.claude
+        );
+        const status = result.success ? '[OK]' : '[ERROR]';
+        await bot.sendMessage(chatId, `${status} ${taskId}\n${result.output}`);
+        return;
+      }
+
+      if (text.startsWith('/ask')) {
+        const prompt = text.replace(/^\/ask\s*/, '').trim();
+        if (!prompt) {
+          await bot.sendMessage(chatId, '사용법: /ask <질문>');
+          return;
+        }
+        await handlePrompt(chatId, prompt);
+        return;
+      }
+
+      if (!text.startsWith('/')) {
+        await handlePrompt(chatId, text);
+      }
+    });
+  }
+
+  // Watch reminders.json for changes (Claude may edit it directly)
+  const remindersFile = reminderMgr.getFilePath();
+  const remindersWatcher = watch(remindersFile, { ignoreInitial: true });
+  remindersWatcher.on('change', () => {
+    reminderMgr.reload();
+  });
+
+  bot.startPolling(handleMessage);
+  return bot;
+}
