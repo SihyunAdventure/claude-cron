@@ -332,13 +332,19 @@ export function startTelegramBot(config: Config, tasks: TaskDefinition[]): Teleg
 
 `;
 
-    // Progress message tracking (debounced)
+    // Progress message tracking (debounced + deduped)
     let lastProgressTime = 0;
+    let lastProgressMessage = '';
     const progressDebounce = 3000; // 3초마다 최대 1개 메시지
     const onProgress = async (message: string) => {
       const now = Date.now();
+      // 동일 메시지는 10초 내 중복 차단
+      if (message === lastProgressMessage && now - lastProgressTime < 10000) {
+        return;
+      }
       if (now - lastProgressTime > progressDebounce) {
         lastProgressTime = now;
+        lastProgressMessage = message;
         try {
           await bot.sendMessage(chatId, message);
         } catch (err) {
@@ -366,12 +372,13 @@ export function startTelegramBot(config: Config, tasks: TaskDefinition[]): Teleg
     if (!result.success && existingSessionId && isSessionError) {
       console.log(`[resume] Session error for ${chatId}, retrying without resume:`, result.output?.slice(0, 100));
       sessionStore.clearSession(String(chatId));
+      // 재시도 시 onProgress 제거하여 중복 메시지 방지
       result = await executeClaudeTask(
         {
           prompt: memoryPrefix + prompt,
           workdir: config.telegramBot.defaultWorkdir,
           systemPrompt: getSystemPrompt(chatId),
-          onProgress,
+          // onProgress 제거 - 재시도에서는 progress 알림 없음
         },
         config.claude
       );
