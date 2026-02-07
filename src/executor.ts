@@ -24,6 +24,7 @@ function escapeShellArg(arg: string): string {
 
 interface StreamEvent {
   type: string;
+  name?: string;
   message?: string;
   content?: Array<{ type: string; text?: string }>;
   result?: string;
@@ -116,29 +117,35 @@ export async function executeClaudeTask(
           // Handle different event types
           switch (event.type) {
             case 'assistant':
-              // Assistant's text message - send progress update
-              if (event.message && onProgress) {
+              // Save assistant message for final result (don't send as progress to avoid duplicates)
+              if (event.message) {
                 lastAssistantMessage = event.message;
-                // Only send meaningful messages (not just tool preparations)
-                if (event.message.length > 20 && !event.message.startsWith('[')) {
-                  onProgress(`💭 ${event.message.slice(0, 200)}${event.message.length > 200 ? '...' : ''}`);
-                }
               }
-              // Also check content array
               if (event.content) {
                 for (const block of event.content) {
                   if (block.type === 'text' && block.text) {
                     lastAssistantMessage = block.text;
-                    if (onProgress && block.text.length > 20) {
-                      onProgress(`💭 ${block.text.slice(0, 200)}${block.text.length > 200 ? '...' : ''}`);
-                    }
                   }
                 }
               }
               break;
 
             case 'tool_use':
-              // Tool being used - can notify for important tools
+              // Notify when important tools are being used
+              if (onProgress && event.name) {
+                const toolNames: Record<string, string> = {
+                  'Read': '📖 파일 읽는 중...',
+                  'Write': '✏️ 파일 작성 중...',
+                  'Edit': '✏️ 파일 수정 중...',
+                  'Bash': '⚙️ 명령 실행 중...',
+                  'Glob': '🔍 파일 검색 중...',
+                  'Grep': '🔍 내용 검색 중...',
+                };
+                const msg = toolNames[event.name];
+                if (msg) {
+                  onProgress(msg);
+                }
+              }
               break;
 
             case 'result':

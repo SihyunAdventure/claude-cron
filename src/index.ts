@@ -9,12 +9,50 @@ import { SessionStore } from './session-store.js';
 import { watch } from 'chokidar';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import fs from 'node:fs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, '..');
 
+const LOCK_FILE = '/tmp/claude-cron.lock';
+
+function acquireLock(): boolean {
+  try {
+    if (fs.existsSync(LOCK_FILE)) {
+      const pid = parseInt(fs.readFileSync(LOCK_FILE, 'utf-8').trim(), 10);
+      // Check if process is running
+      try {
+        process.kill(pid, 0); // Signal 0 = check if exists
+        console.error(`claude-cron is already running (PID: ${pid}). Exiting.`);
+        return false;
+      } catch {
+        // Process not running, stale lock file
+        console.log('Removing stale lock file');
+      }
+    }
+    fs.writeFileSync(LOCK_FILE, String(process.pid));
+    return true;
+  } catch (err) {
+    console.error('Failed to acquire lock:', err);
+    return false;
+  }
+}
+
+function releaseLock(): void {
+  try {
+    if (fs.existsSync(LOCK_FILE)) {
+      fs.unlinkSync(LOCK_FILE);
+    }
+  } catch {}
+}
+
 async function main() {
   console.log('Claude Cron Service starting...');
+
+  // Acquire singleton lock
+  if (!acquireLock()) {
+    process.exit(1);
+  }
 
   // Load config
   const config = loadConfig();
@@ -75,9 +113,11 @@ async function main() {
     scheduledTasks.forEach((t) => t.stop());
     heartbeatTask?.stop();
     watcher.close();
+    releaseLock();
     process.exit(0);
   };
 
+  process.on('exit', releaseLock);
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 
