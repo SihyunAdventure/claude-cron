@@ -310,6 +310,14 @@ export function startTelegramBot(config: Config, tasks: TaskDefinition[]): Teleg
   }
 
   async function handlePrompt(chatId: number, prompt: string): Promise<void> {
+    // Pull latest changes before processing
+    try {
+      const workdir = config.telegramBot.defaultWorkdir || process.cwd();
+      await execAsync('git pull --ff-only', { cwd: workdir, timeout: 15000 });
+    } catch (err) {
+      console.error('[git pull] Failed:', err);
+    }
+
     const typingInterval = await sendTyping(chatId);
 
     // Initialize per-user memory
