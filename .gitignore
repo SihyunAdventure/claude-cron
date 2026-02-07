@@ -18,8 +18,9 @@ sessions/
 # OS files
 .DS_Store
 
-# Memory (runtime data)
-memory/
+# Memory (runtime data - clients는 추적)
+memory/*
+!memory/clients/
 
 # Tasks (runtime data)
 tasks/
