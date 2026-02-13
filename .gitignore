@@ -21,9 +21,9 @@ sessions/
 # OS files
 .DS_Store
 
-# Memory (runtime data - clients는 추적)
-memory/*
-!memory/clients/
+# Memory - 핵심 MD 파일은 git 추적, 일별 로그/이미지만 제외
+memory/*/daily/
+memory/images/
 
 # Tasks (runtime data)
 tasks/

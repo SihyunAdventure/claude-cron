@@ -212,6 +212,15 @@ function getUserMemoryDir(baseMemoryDir: string, chatId: number): string {
 function initUserMemory(baseMemoryDir: string, chatId: number): void {
   const userDir = getUserMemoryDir(baseMemoryDir, chatId);
 
+  // projects 심볼릭 링크 생성 (공유 프로젝트 데이터 접근용)
+  const projectsLink = path.join(userDir, 'projects');
+  const projectsTarget = path.join(baseMemoryDir, 'projects');
+  if (!fs.existsSync(projectsLink) && fs.existsSync(projectsTarget)) {
+    try {
+      fs.symlinkSync(projectsTarget, projectsLink);
+    } catch {}
+  }
+
   // Copy template files if they don't exist yet
   // Templates are stored in memory/templates/ and copied to user-specific directories
   const templates: [string, string][] = [
@@ -414,6 +423,7 @@ export function startTelegramBot(config: Config, tasks: TaskDefinition[]): Teleg
 - 기억 요청 → ${userMemDir}/user/MEMORY.md에 append_file로 추가 (덮어쓰기 금지)
 - 봇 설정 → ${userMemDir}/bot/IDENTITY.md를 write_file로 업데이트
 - 업무 → ${userMemDir}/areas/work.md, 건강 → ${userMemDir}/areas/health.md
+- 프로젝트 정보 → ${userMemDir}/projects/ (목록: ${userMemDir}/projects/_overview.md)
 [알림: ${remindersPath}] 알람 등록·수정·삭제 시 read_file로 읽고 write_file로 수정. 형식: [{"id":"r-타임스탬프","chatId":${chatId},"type":"message"|"task","message":"내용","hour":시,"minute":분,"cron":"분 시 * * *","createdAt":"ISO"}]
 
 `
@@ -427,6 +437,7 @@ export function startTelegramBot(config: Config, tasks: TaskDefinition[]): Teleg
 - 기억 요청 → ${userMemDir}/user/MEMORY.md에 append (Write)로 추가 (덮어쓰기 금지)
 - 봇 설정 → ${userMemDir}/bot/IDENTITY.md를 Write로 업데이트
 - 업무 → ${userMemDir}/areas/work.md, 건강 → ${userMemDir}/areas/health.md
+- 프로젝트 정보 → ${userMemDir}/projects/ (목록: ${userMemDir}/projects/_overview.md)
 [알림: ${remindersPath}] 알람 등록·수정·삭제 시 Read하고 Write로 수정. 형식: [{"id":"r-타임스탬프","chatId":${chatId},"type":"message"|"task","message":"내용","hour":시,"minute":분,"cron":"분 시 * * *","createdAt":"ISO"}]
 
 `;
