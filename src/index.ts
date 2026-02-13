@@ -6,6 +6,7 @@ import { startScheduler } from './scheduler.js';
 import { startHeartbeat } from './heartbeat.js';
 import { startTelegramBot } from './telegram-bot.js';
 import { SessionStore } from './session-store.js';
+import { getChatGPTBrowserClient, stopChatGPTBrowserClient } from './chatgpt-browser.js';
 import { watch } from 'chokidar';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -72,6 +73,18 @@ async function main() {
   // Start heartbeat
   const heartbeatTask = startHeartbeat(config, notifier);
 
+  // Start ChatGPT Browser service (if enabled) - 사전 워밍업
+  if (config.chatgptBrowser?.enabled) {
+    try {
+      const browserClient = getChatGPTBrowserClient(config.chatgptBrowser);
+      await browserClient.start();
+      console.log('ChatGPT Browser service started');
+    } catch (error) {
+      console.error('Failed to start ChatGPT Browser service:', error);
+      // 실패해도 서비스는 계속 실행 (fallback이 있음)
+    }
+  }
+
   // Start Telegram bot (if enabled)
   if (config.telegramBot.enabled) {
     try {
@@ -108,18 +121,32 @@ async function main() {
   });
 
   // Graceful shutdown
-  const shutdown = () => {
-    console.log('Shutting down...');
+  const shutdown = async (signal?: string) => {
+    console.log(`Shutting down... (signal: ${signal || 'unknown'})`);
+    console.log('Stack trace:', new Error().stack);
     scheduledTasks.forEach((t) => t.stop());
     heartbeatTask?.stop();
     watcher.close();
+    // ChatGPT Browser 서비스 종료 (Chrome 프로세스 정리)
+    await stopChatGPTBrowserClient().catch(() => {});
     releaseLock();
     process.exit(0);
   };
 
-  process.on('exit', releaseLock);
-  process.on('SIGINT', shutdown);
-  process.on('SIGTERM', shutdown);
+  process.on('exit', (code) => {
+    console.log(`Process exit with code: ${code}`);
+    releaseLock();
+  });
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGHUP', () => shutdown('SIGHUP'));
+  process.on('uncaughtException', (err) => {
+    console.error('Uncaught exception:', err);
+    shutdown('uncaughtException');
+  });
+  process.on('unhandledRejection', (reason) => {
+    console.error('Unhandled rejection:', reason);
+  });
 
   console.log('Claude Cron Service running. Press Ctrl+C to stop.');
 }

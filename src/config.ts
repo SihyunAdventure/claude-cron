@@ -67,14 +67,44 @@ export interface LoggingConfig {
   retention: number;
 }
 
+export interface OpenAIConfig {
+  enabled: boolean;
+  binary?: string;
+  model: string;
+  maxTokens: number;
+  defaultTimeout?: number;
+  apiKey?: string;
+  useOAuth?: boolean;
+}
+
+export interface OpenClawGatewayConfig {
+  enabled: boolean;
+  url: string;          // ws://localhost:18789
+  token: string;        // gateway auth token
+  sessionId?: string;   // persistent session key
+  timeout?: number;     // request timeout in ms (default: 30000)
+}
+
+export interface ChatGPTBrowserConfig {
+  enabled: boolean;
+  model?: string;       // e.g. gpt-5.3-codex-spark
+  timeout?: number;     // request timeout in ms (default: 30000)
+  headless?: boolean;   // Chrome headless 모드 (default: true)
+  cdpPort?: number;     // CDP 디버깅 포트 (default: 19222)
+}
+
 export interface Config {
   claude: ClaudeConfig;
+  openai?: OpenAIConfig;
+  openclawGateway?: OpenClawGatewayConfig;
+  chatgptBrowser?: ChatGPTBrowserConfig;
   memory: MemoryConfig;
   notifications: NotificationsConfig;
   telegramBot: TelegramBotConfig;
   heartbeat: HeartbeatConfig;
   sessions: SessionsConfig;
   logging: LoggingConfig;
+  defaultProvider?: 'claude' | 'openai';
 }
 
 /**

@@ -2,12 +2,13 @@ import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
 import fs from 'node:fs';
 import path from 'node:path';
-import { executeClaudeTask } from './executor.js';
+import { executeTask, Provider } from './unified-executor.js';
 import { SessionStore } from './session-store.js';
 import { watch } from 'chokidar';
 import { ReminderManager, formatTime } from './reminders.js';
 import type { TaskDefinition } from './task-loader.js';
 import type { Config } from './config.js';
+import { ToolExecutor } from './tool-executor.js';
 
 const execAsync = promisify(exec);
 
@@ -102,12 +103,19 @@ class TelegramBot {
 
   async getUpdates(): Promise<TelegramUpdate[]> {
     try {
+      console.log('[getUpdates] Polling... offset:', this.offset);
       const data = await this.apiGet(`getUpdates?offset=${this.offset}&timeout=30`);
-      if (data.ok && data.result.length > 0) {
+      if (!data.ok) {
+        console.error('[getUpdates] API error:', data.error_code, data.description);
+        return [];
+      }
+      console.log(`[getUpdates] OK, received ${data.result.length} update(s)`);
+      if (data.result.length > 0) {
         this.offset = data.result[data.result.length - 1].update_id + 1;
       }
-      return data.ok ? data.result : [];
-    } catch {
+      return data.result;
+    } catch (err) {
+      console.error('[getUpdates] Exception:', err);
       return [];
     }
   }
@@ -163,6 +171,23 @@ class ChatQueue {
   }
 }
 
+// Provider selection per chat (in-memory, resets on restart)
+class ProviderStore {
+  private providers: Map<number, Provider> = new Map();
+
+  get(chatId: number): Provider | undefined {
+    return this.providers.get(chatId);
+  }
+
+  set(chatId: number, provider: Provider): void {
+    this.providers.set(chatId, provider);
+  }
+
+  clear(chatId: number): void {
+    this.providers.delete(chatId);
+  }
+}
+
 function getTodayDateStr(): string {
   return new Date().toISOString().slice(0, 10);
 }
@@ -210,6 +235,33 @@ function initUserMemory(baseMemoryDir: string, chatId: number): void {
   }
 }
 
+/**
+ * 메모리 파일 내용을 읽어서 인라인 문자열로 반환합니다.
+ * Codex API처럼 파일 읽기 도구가 없는 stateless 프로바이더용.
+ */
+function getInlinedMemoryContent(baseMemoryDir: string, chatId: number): string {
+  const userDir = getUserMemoryDir(baseMemoryDir, chatId);
+  const files: { path: string; label: string }[] = [
+    { path: path.join(userDir, 'bot', 'IDENTITY.md'), label: '봇 정체성' },
+    { path: path.join(userDir, 'user', 'USER.md'), label: '사용자 정보' },
+    { path: path.join(userDir, 'user', 'MEMORY.md'), label: '중요 기억' },
+  ];
+
+  const sections: string[] = [];
+  for (const file of files) {
+    try {
+      const text = fs.readFileSync(file.path, 'utf-8').trim();
+      if (text) {
+        sections.push(`[${file.label}]\n${text}`);
+      }
+    } catch {
+      // 파일 없으면 무시
+    }
+  }
+
+  return sections.join('\n\n');
+}
+
 function appendDailyLog(userMemoryDir: string, prompt: string, response: string): void {
   const dateStr = getTodayDateStr();
   const logFile = path.join(userMemoryDir, 'daily', `${dateStr}.md`);
@@ -241,6 +293,7 @@ export function startTelegramBot(config: Config, tasks: TaskDefinition[]): Teleg
   const allowedChatIds = new Set(config.telegramBot.allowedChatIds);
   const baseMemoryDir = config.memory?.dir || path.resolve(process.cwd(), 'memory');
   const chatQueue = new ChatQueue();
+  const providerStore = new ProviderStore();
 
   function isAuthorized(chatId: number): boolean {
     return allowedChatIds.has(String(chatId));
@@ -309,14 +362,8 @@ export function startTelegramBot(config: Config, tasks: TaskDefinition[]): Teleg
     return setInterval(send, 4000);
   }
 
-  async function handlePrompt(chatId: number, prompt: string): Promise<void> {
-    // Pull latest changes before processing
-    try {
-      const workdir = config.telegramBot.defaultWorkdir || process.cwd();
-      await execAsync('git pull --ff-only', { cwd: workdir, timeout: 15000 });
-    } catch (err) {
-      console.error('[git pull] Failed:', err);
-    }
+  async function handlePrompt(chatId: number, prompt: string, options?: { forceProvider?: Provider; imagePath?: string }): Promise<void> {
+    console.log(`[handlePrompt] Starting for chat ${chatId}`);
 
     const typingInterval = await sendTyping(chatId);
 
@@ -329,14 +376,54 @@ export function startTelegramBot(config: Config, tasks: TaskDefinition[]): Teleg
     const existingSessionId = sessionStore.getSession(String(chatId));
     const userMemDir = getUserMemoryDir(baseMemoryDir, chatId);
     const remindersPath = path.resolve(config.telegramBot.defaultWorkdir || '.', 'config', 'reminders.json');
-    const memoryPrefix = `[메모리 시스템]
+    // 실효 프로바이더: 강제 지정 → 사용자 설정 → config 기본값 → claude
+    const currentProvider = options?.forceProvider || providerStore.get(chatId) || config.defaultProvider || 'claude';
+
+    // openai 프로바이더일 때 에이전트 모드용 ToolExecutor 생성
+    let toolExecutor: ToolExecutor | undefined;
+    if (currentProvider === 'openai' && config.memory?.enabled) {
+      toolExecutor = new ToolExecutor([userMemDir, path.dirname(remindersPath)]);
+    }
+
+    // 프로바이더별 memoryPrefix 분기
+    // Claude: Read/Write 도구 사용 (기존 방식)
+    // OpenAI 에이전트: 코어 파일 인라인 + 도구로 추가 읽기/쓰기 (하이브리드)
+    const isAgent = currentProvider === 'openai' && toolExecutor;
+    const readCmd = isAgent ? 'read_file' : 'Read';
+    const writeCmd = isAgent ? 'write_file' : 'Write';
+    const appendCmd = isAgent ? 'append_file' : 'append (Write)';
+
+    // 에이전트 모드: 코어 메모리 파일을 미리 읽어서 인라인
+    // → 첫 API 호출부터 성격/맥락이 반영됨 (에이전트 루프 1회 절약)
+    // → 메모리 파일 수정하면 다음 대화부터 자동 반영 (하드코딩 아님)
+    let inlinedMemory = '';
+    if (isAgent && config.memory?.enabled) {
+      inlinedMemory = getInlinedMemoryContent(baseMemoryDir, chatId);
+    }
+
+    const memoryPrefix = isAgent
+      ? `${inlinedMemory ? `[현재 메모리]\n${inlinedMemory}\n\n` : ''}[메모리 시스템]
 경로: ${userMemDir}
-- 대화 시작 시: user/USER.md, user/MEMORY.md, bot/IDENTITY.md를 Read하여 맥락 파악
-- 사용자 정보(이름, 선호 등) → user/USER.md를 Read 후 업데이트
-- 기억 요청, 중요 정보 → user/MEMORY.md를 Read 후 append (덮어쓰기 금지)
-- 봇 이름/성격 설정 → bot/IDENTITY.md를 Read 후 업데이트
-- 업무/프로젝트 정보 → areas/work.md, 건강/운동 정보 → areas/health.md
-[알림 관리: ${remindersPath}] 알람/리마인더 등록·수정·삭제 요청 시 이 JSON 파일을 Read하고 Write로 수정하라. 형식: [{"id":"r-타임스탬프","chatId":${chatId},"type":"message"|"task","message":"내용","hour":시,"minute":분,"cron":"분 시 * * *","createdAt":"ISO"}]. type=task는 Claude가 실행, type=message는 단순 알림.
+- 위 [현재 메모리]에 이미 코어 파일 내용이 포함되어 있으므로 다시 읽을 필요 없음
+- 추가 정보 필요 시: ${userMemDir}/areas/work.md, ${userMemDir}/areas/health.md 등을 read_file로 읽기
+- 사용자 정보 변경 → ${userMemDir}/user/USER.md를 write_file로 업데이트
+- 기억 요청 → ${userMemDir}/user/MEMORY.md에 append_file로 추가 (덮어쓰기 금지)
+- 봇 설정 → ${userMemDir}/bot/IDENTITY.md를 write_file로 업데이트
+- 업무 → ${userMemDir}/areas/work.md, 건강 → ${userMemDir}/areas/health.md
+[알림: ${remindersPath}] 알람 등록·수정·삭제 시 read_file로 읽고 write_file로 수정. 형식: [{"id":"r-타임스탬프","chatId":${chatId},"type":"message"|"task","message":"내용","hour":시,"minute":분,"cron":"분 시 * * *","createdAt":"ISO"}]
+
+`
+      : `[메모리 시스템]
+경로: ${userMemDir}
+- 대화 시작 시 다음 3개 파일을 Read하여 맥락 파악:
+  1. ${userMemDir}/bot/IDENTITY.md
+  2. ${userMemDir}/user/USER.md
+  3. ${userMemDir}/user/MEMORY.md
+- 사용자 정보 변경 → ${userMemDir}/user/USER.md를 Write로 업데이트
+- 기억 요청 → ${userMemDir}/user/MEMORY.md에 append (Write)로 추가 (덮어쓰기 금지)
+- 봇 설정 → ${userMemDir}/bot/IDENTITY.md를 Write로 업데이트
+- 업무 → ${userMemDir}/areas/work.md, 건강 → ${userMemDir}/areas/health.md
+[알림: ${remindersPath}] 알람 등록·수정·삭제 시 Read하고 Write로 수정. 형식: [{"id":"r-타임스탬프","chatId":${chatId},"type":"message"|"task","message":"내용","hour":시,"minute":분,"cron":"분 시 * * *","createdAt":"ISO"}]
 
 `;
 
@@ -361,15 +448,18 @@ export function startTelegramBot(config: Config, tasks: TaskDefinition[]): Teleg
       }
     };
 
-    let result = await executeClaudeTask(
+    let result = await executeTask(
       {
         prompt: memoryPrefix + prompt,
         workdir: config.telegramBot.defaultWorkdir,
         systemPrompt: getSystemPrompt(chatId),
         sessionId: existingSessionId || undefined,
         onProgress,
+        provider: currentProvider,
+        toolExecutor,
+        imagePath: options?.imagePath,
       },
-      config.claude
+      config
     );
 
     // If resume failed (stale session or auth error), retry without session
@@ -381,14 +471,16 @@ export function startTelegramBot(config: Config, tasks: TaskDefinition[]): Teleg
       console.log(`[resume] Session error for ${chatId}, retrying without resume:`, result.output?.slice(0, 100));
       sessionStore.clearSession(String(chatId));
       // 재시도 시 onProgress 제거하여 중복 메시지 방지
-      result = await executeClaudeTask(
+      result = await executeTask(
         {
           prompt: memoryPrefix + prompt,
           workdir: config.telegramBot.defaultWorkdir,
           systemPrompt: getSystemPrompt(chatId),
+          provider: currentProvider,
+          toolExecutor,
           // onProgress 제거 - 재시도에서는 progress 알림 없음
         },
-        config.claude
+        config
       );
     }
 
@@ -450,13 +542,22 @@ export function startTelegramBot(config: Config, tasks: TaskDefinition[]): Teleg
 
         // Build prompt with image reference
         const userPrompt = caption || '이 이미지를 분석해줘';
-        const imagePrompt = `[이미지 분석 요청]
+
+        // 프로바이더별 이미지 처리 분기
+        const currentProvider = providerStore.get(chatId) || config.defaultProvider || 'claude';
+
+        if (currentProvider === 'openai' && config.chatgptBrowser?.enabled) {
+          // OpenAI: base64로 변환하여 gpt-4o 비전 모델로 직접 전송
+          await handlePrompt(chatId, userPrompt, { imagePath: localPath });
+        } else {
+          // Claude: Read 도구로 로컬 이미지 파일을 직접 읽기
+          const imagePrompt = `[이미지 분석 요청]
 이미지 경로: ${localPath}
 사용자 메시지: ${userPrompt}
 
 위 경로의 이미지를 Read 도구로 읽어서 분석해줘.`;
-
-        await handlePrompt(chatId, imagePrompt);
+          await handlePrompt(chatId, imagePrompt);
+        }
       });
       return;
     }
@@ -491,6 +592,50 @@ export function startTelegramBot(config: Config, tasks: TaskDefinition[]): Teleg
       return;
     }
 
+    // /model 명령: provider 전환
+    if (text === '/model' || text.startsWith('/model ')) {
+      const arg = text.replace(/^\/model\s*/, '').trim().toLowerCase();
+
+      if (!arg) {
+        // 현재 상태 표시
+        const current = providerStore.get(chatId) || config.defaultProvider || 'claude';
+        const openaiStatus = config.openai?.enabled ? '활성화' : '비활성화';
+        const gatewayNote = config.openclawGateway?.enabled ? ' (Gateway 활성화)' : '';
+        await bot.sendMessage(chatId,
+          `현재 모델: ${current}\n\n` +
+          `사용 가능한 모델:\n` +
+          `- claude: Claude CLI (기본)\n` +
+          `- openai: ChatGPT (${openaiStatus})${gatewayNote}\n\n` +
+          `전환: /model claude 또는 /model openai`
+        );
+        return;
+      }
+
+      if (arg === 'claude') {
+        providerStore.set(chatId, 'claude');
+        await bot.sendMessage(chatId, 'Claude로 전환했습니다.');
+        return;
+      }
+
+      if (arg === 'openai' || arg === 'chatgpt' || arg === 'gpt') {
+        if (!config.openai?.enabled && !config.openclawGateway?.enabled && !config.chatgptBrowser?.enabled) {
+          await bot.sendMessage(chatId,
+            'OpenAI가 비활성화 상태입니다.\n' +
+            'config.yaml에서 chatgptBrowser.enabled, openai.enabled, 또는 openclawGateway.enabled를 true로 설정하세요.'
+          );
+          return;
+        }
+        providerStore.set(chatId, 'openai');
+        const method = config.chatgptBrowser?.enabled ? 'Browser' :
+          config.openclawGateway?.enabled ? 'Gateway' : 'Codex CLI';
+        await bot.sendMessage(chatId, `ChatGPT (${method})로 전환했습니다.`);
+        return;
+      }
+
+      await bot.sendMessage(chatId, '알 수 없는 모델입니다. claude 또는 openai를 입력하세요.');
+      return;
+    }
+
     if (text === '/alarms' || text.startsWith('/alarms ')) {
       const list = reminderMgr.list(chatId);
       if (list.length === 0) {
@@ -517,7 +662,7 @@ export function startTelegramBot(config: Config, tasks: TaskDefinition[]): Teleg
     }
 
     if (text === '/start') {
-      await bot.sendMessage(chatId, 'Claude Cron Bot\n\n/ask <질문> - Claude에게 질문\n/alarm <시간+내용> - 알람 등록\n/alarms - 알람 목록\n/delalarm <번호> - 알람 삭제\n/run <task-id> - 태스크 실행\n/tasks - 태스크 목록\n/new - 새 대화\n/status - 세션 상태\n\n또는 그냥 메시지를 보내세요.');
+      await bot.sendMessage(chatId, 'Claude Cron Bot\n\n/ask <질문> - Claude에게 질문\n/alarm <시간+내용> - 알람 등록\n/alarms - 알람 목록\n/delalarm <번호> - 알람 삭제\n/run <task-id> - 태스크 실행\n/tasks - 태스크 목록\n/new - 새 대화\n/status - 세션 상태\n/model - 모델 선택 (Claude/ChatGPT)\n\n또는 그냥 메시지를 보내세요.');
       return;
     }
 
@@ -536,9 +681,10 @@ export function startTelegramBot(config: Config, tasks: TaskDefinition[]): Teleg
           return;
         }
         await bot.sendMessage(chatId, `태스크 실행 중: ${taskId}`);
-        const result = await executeClaudeTask(
-          { prompt: task.prompt, workdir: task.workdir, timeout: task.timeout },
-          config.claude
+        const currentProvider = providerStore.get(chatId);
+        const result = await executeTask(
+          { prompt: task.prompt, workdir: task.workdir, timeout: task.timeout, provider: currentProvider },
+          config
         );
         const status = result.success ? '[OK]' : '[ERROR]';
         await bot.sendMessage(chatId, `${status} ${taskId}\n${result.output}`);

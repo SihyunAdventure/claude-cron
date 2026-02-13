@@ -7,6 +7,38 @@ claude:
   allowedTools: ["Bash", "Read", "Write", "Glob", "Grep"]
   extraArgs: []
 
+# OpenAI/ChatGPT configuration
+# Set OPENAI_API_KEY in .env or use OAuth with useOAuth: true
+openai:
+  enabled: true
+  binary: /opt/homebrew/bin/codex
+  model: gpt-5.3-codex-spark
+  maxTokens: 16384
+  defaultTimeout: 300000
+
+# OpenClaw Gateway: WebSocket으로 게이트웨이에 직접 연결 (가장 빠름, ~2-4초)
+# Cloudflare bypass를 게이트웨이가 처리하므로 직접 API 호출 불필요
+openclawGateway:
+  enabled: true
+  url: ws://localhost:18789
+  token: ${OPENCLAW_GATEWAY_TOKEN}
+  sessionId: claude-cron-default
+  timeout: 30000
+
+# ChatGPT Browser: Playwright + 실제 Chrome으로 Cloudflare 자체 우회
+# OpenClaw 게이트웨이 의존 없이 직접 ChatGPT API 호출 (2-5초)
+chatgptBrowser:
+  enabled: true
+  model: gpt-5.3-codex-spark
+  visionModel: gpt-5.1  # 이미지 분석용 비전 모델 (codex-spark는 이미지 미지원이므로 자동 전환)
+  timeout: 30000
+  headless: true     # cf_clearance 쿠키가 user-data-dir에 캐시되어 headless 가능
+  cdpPort: 19222
+
+# Default provider: 'claude' or 'openai'
+# openai 선택 시 chatgptBrowser → openclawGateway → codex CLI 순으로 fallback
+defaultProvider: openai
+
 memory:
   enabled: true
   dir: ./memory

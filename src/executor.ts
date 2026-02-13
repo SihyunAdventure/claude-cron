@@ -1,5 +1,8 @@
-import { spawn } from 'node:child_process';
+import { exec } from 'node:child_process';
+import { promisify } from 'node:util';
 import type { ClaudeConfig } from './config.js';
+
+const execAsync = promisify(exec);
 
 export interface ExecutorOptions {
   prompt: string;
@@ -22,17 +25,6 @@ function escapeShellArg(arg: string): string {
   return "'" + arg.replace(/'/g, "'\\''") + "'";
 }
 
-interface StreamEvent {
-  type: string;
-  name?: string;
-  message?: string;
-  content?: Array<{ type: string; text?: string }>;
-  result?: string;
-  session_id?: string;
-  is_error?: boolean;
-  subtype?: string;
-}
-
 export async function executeClaudeTask(
   options: ExecutorOptions,
   config: ClaudeConfig
@@ -43,189 +35,90 @@ export async function executeClaudeTask(
     timeout = config.defaultTimeout || 300000,
     sessionId,
     allowedTools = config.allowedTools || ['Bash', 'Read', 'Write', 'Glob', 'Grep'],
-    onProgress,
   } = options;
 
-  const args: string[] = [];
+  let cmd = config.binary;
 
   if (sessionId) {
-    args.push('--resume', sessionId);
+    cmd += ` --resume ${escapeShellArg(sessionId)}`;
   }
 
   if (options.systemPrompt) {
-    args.push('--system-prompt', options.systemPrompt);
+    cmd += ` --system-prompt ${escapeShellArg(options.systemPrompt)}`;
   }
 
-  args.push('-p', prompt);
-  args.push('--output-format', 'stream-json');
-  args.push('--verbose');
-  args.push('--allowedTools', allowedTools.join(','));
+  cmd += ` -p ${escapeShellArg(prompt)}`;
+  cmd += ` --output-format ${config.outputFormat || 'json'}`;
+  cmd += ` --allowedTools ${escapeShellArg(allowedTools.join(','))}`;
 
   if (config.extraArgs) {
-    args.push(...config.extraArgs);
+    cmd += ` ${config.extraArgs.join(' ')}`;
   }
 
-  return new Promise((resolve) => {
-    const child = spawn(config.binary, args, {
+  cmd += ` < /dev/null`;
+
+  console.log('[executor] Starting Claude CLI...');
+  console.log('[executor] Workdir:', workdir);
+  console.log('[executor] Timeout:', timeout);
+  console.log('[executor] Command length:', cmd.length);
+  console.log('[executor] Command preview:', cmd.slice(0, 200));
+
+  try {
+    const { stdout } = await execAsync(cmd, {
       cwd: workdir,
+      timeout,
+      maxBuffer: 10 * 1024 * 1024,
       env: {
         ...process.env,
+        // Use default ~/.claude config (shares Max Plan login session)
         ...(process.env.CLAUDE_CRON_CONFIG_DIR && {
           CLAUDE_CONFIG_DIR: process.env.CLAUDE_CRON_CONFIG_DIR,
         }),
       },
-      stdio: ['pipe', 'pipe', 'pipe'],
     });
 
-    // Close stdin immediately
-    child.stdin.end();
-
-    let finalResult = '';
+    let parsedOutput: any;
     let extractedSessionId = sessionId || '';
-    let isError = false;
-    let lastAssistantMessage = '';
-    let buffer = '';
 
-    const timeoutId = setTimeout(() => {
-      child.kill('SIGTERM');
-      resolve({
-        output: 'Timeout: 작업이 시간 내에 완료되지 않았습니다.',
-        sessionId: extractedSessionId,
-        success: false,
-        error: 'Timeout',
-      });
-    }, timeout);
-
-    child.stdout.on('data', (data: Buffer) => {
-      buffer += data.toString();
-
-      // Process complete lines
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || ''; // Keep incomplete line in buffer
-
-      for (const line of lines) {
-        if (!line.trim()) continue;
-
-        try {
-          const event: StreamEvent = JSON.parse(line);
-
-          // Extract session ID
-          if (event.session_id) {
-            extractedSessionId = event.session_id;
-          }
-
-          // Handle different event types
-          switch (event.type) {
-            case 'assistant':
-              // Save assistant message for final result (don't send as progress to avoid duplicates)
-              if (event.message) {
-                lastAssistantMessage = event.message;
-              }
-              if (event.content) {
-                for (const block of event.content) {
-                  if (block.type === 'text' && block.text) {
-                    lastAssistantMessage = block.text;
-                  }
-                }
-              }
-              break;
-
-            case 'tool_use':
-              // Notify when important tools are being used
-              if (onProgress && event.name) {
-                const toolNames: Record<string, string> = {
-                  'Read': '📖 파일 읽는 중...',
-                  'Write': '✏️ 파일 작성 중...',
-                  'Edit': '✏️ 파일 수정 중...',
-                  'Bash': '⚙️ 명령 실행 중...',
-                  'Glob': '🔍 파일 검색 중...',
-                  'Grep': '🔍 내용 검색 중...',
-                };
-                const msg = toolNames[event.name];
-                if (msg) {
-                  onProgress(msg);
-                }
-              }
-              break;
-
-            case 'result':
-              // Final result
-              finalResult = event.result || lastAssistantMessage || '';
-              isError = event.is_error === true;
-              if (event.subtype === 'error_tool_use') {
-                isError = true;
-              }
-              break;
-
-            case 'error':
-              isError = true;
-              finalResult = event.message || 'Unknown error';
-              break;
-          }
-        } catch {
-          // Not JSON, might be raw output or error
-          if (line.includes('Invalid API key') || line.includes('No conversation found')) {
-            // Session/auth error - will be handled by retry logic
-            isError = true;
-            finalResult = line;
-          }
-        }
+    try {
+      parsedOutput = JSON.parse(stdout);
+      if (parsedOutput.session_id) {
+        extractedSessionId = parsedOutput.session_id;
+      } else if (parsedOutput.sessionId) {
+        extractedSessionId = parsedOutput.sessionId;
       }
-    });
+    } catch {
+      parsedOutput = { rawOutput: stdout };
+    }
 
-    let stderrOutput = '';
-    child.stderr.on('data', (data: Buffer) => {
-      stderrOutput += data.toString();
-    });
+    const output =
+      typeof parsedOutput === 'string'
+        ? parsedOutput
+        : parsedOutput.result || parsedOutput.rawOutput || JSON.stringify(parsedOutput, null, 2);
 
-    child.on('close', (code) => {
-      clearTimeout(timeoutId);
-
-      // Process any remaining buffer
-      if (buffer.trim()) {
-        try {
-          const event: StreamEvent = JSON.parse(buffer);
-          if (event.result) {
-            finalResult = event.result;
-          }
-          if (event.session_id) {
-            extractedSessionId = event.session_id;
-          }
-          if (event.is_error) {
-            isError = true;
-          }
-        } catch {
-          // Ignore parse errors for incomplete data
-        }
+    return { output, sessionId: extractedSessionId, success: true };
+  } catch (error: any) {
+    const stdout = error.stdout || '';
+    if (stdout.trim()) {
+      try {
+        const parsed = JSON.parse(stdout);
+        const sid = parsed.session_id || parsed.sessionId || sessionId || '';
+        const out = parsed.result || JSON.stringify(parsed, null, 2);
+        const isError = parsed.is_error === true;
+        return { output: out, sessionId: sid, success: !isError };
+      } catch {
+        // fall through
       }
-
-      // If no result but we have assistant message, use that
-      if (!finalResult && lastAssistantMessage) {
-        finalResult = lastAssistantMessage;
-      }
-
-      // Handle errors
-      if (code !== 0 && !finalResult) {
-        finalResult = stderrOutput || `Process exited with code ${code}`;
-        isError = true;
-      }
-
-      resolve({
-        output: finalResult || 'No response',
-        sessionId: extractedSessionId,
-        success: !isError && code === 0,
-        error: isError ? (stderrOutput || finalResult) : undefined,
-      });
-    });
-
-    child.on('error', (err) => {
-      clearTimeout(timeoutId);
-      resolve({
-        output: err.message,
-        sessionId: extractedSessionId,
-        success: false,
-        error: err.message,
-      });
-    });
-  });
+    }
+    console.error('[executor] Error:', error.message);
+    console.error('[executor] Code:', error.code);
+    console.error('[executor] Stderr:', error.stderr?.slice(0, 500));
+    console.error('[executor] Cmd:', cmd.slice(0, 200));
+    return {
+      output: error.stderr || error.message || 'Unknown error',
+      sessionId: sessionId || '',
+      success: false,
+      error: error.message,
+    };
+  }
 }
