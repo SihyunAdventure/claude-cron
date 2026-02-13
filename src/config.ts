@@ -93,11 +93,17 @@ export interface ChatGPTBrowserConfig {
   cdpPort?: number;     // CDP 디버깅 포트 (default: 19222)
 }
 
+export interface GoogleCalendarConfig {
+  enabled: boolean;
+  credentialsFile?: string; // 기본: config/google-credentials.json
+}
+
 export interface Config {
   claude: ClaudeConfig;
   openai?: OpenAIConfig;
   openclawGateway?: OpenClawGatewayConfig;
   chatgptBrowser?: ChatGPTBrowserConfig;
+  googleCalendar?: GoogleCalendarConfig;
   memory: MemoryConfig;
   notifications: NotificationsConfig;
   telegramBot: TelegramBotConfig;

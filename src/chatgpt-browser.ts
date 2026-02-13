@@ -239,7 +239,7 @@ export class ChatGPTBrowserClient {
     imageBase64?: string,
     imageMimeType?: string,
   ): Promise<ChatGPTBrowserResult> {
-    const MAX_AGENT_ITERATIONS = 10;
+    const MAX_AGENT_ITERATIONS = 20;
     const sentinelToken = await this.getSentinelToken(tokens);
 
     const headers: Record<string, string> = {

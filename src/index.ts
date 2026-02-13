@@ -7,6 +7,7 @@ import { startHeartbeat } from './heartbeat.js';
 import { startTelegramBot } from './telegram-bot.js';
 import { SessionStore } from './session-store.js';
 import { getChatGPTBrowserClient, stopChatGPTBrowserClient } from './chatgpt-browser.js';
+import { initGoogleCalendar } from './google-calendar.js';
 import { watch } from 'chokidar';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -82,6 +83,28 @@ async function main() {
     } catch (error) {
       console.error('Failed to start ChatGPT Browser service:', error);
       // 실패해도 서비스는 계속 실행 (fallback이 있음)
+    }
+  }
+
+  // Initialize Google Calendar (if enabled)
+  if (config.googleCalendar?.enabled) {
+    try {
+      const rawCredFile = config.googleCalendar.credentialsFile
+        || 'config/google-credentials.json';
+      const credFile = path.isAbsolute(rawCredFile)
+        ? rawCredFile
+        : path.resolve(PROJECT_ROOT, rawCredFile);
+      const calResult = await initGoogleCalendar(credFile);
+      if (calResult.ready) {
+        console.log('Google Calendar connected');
+      } else {
+        console.log('Google Calendar requires auth. Use /gcal command in Telegram to authenticate.');
+        if (calResult.authUrl) {
+          console.log('Auth URL:', calResult.authUrl);
+        }
+      }
+    } catch (error) {
+      console.error('Failed to initialize Google Calendar:', error);
     }
   }
 

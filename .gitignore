@@ -7,6 +7,9 @@ dist/
 # Environment variables
 .env
 
+# Google OAuth credentials (민감 정보)
+config/google-credentials.json
+
 # Logs
 logs/
 

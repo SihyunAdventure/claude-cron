@@ -6,6 +6,7 @@ import { executeTask, Provider } from './unified-executor.js';
 import { SessionStore } from './session-store.js';
 import { watch } from 'chokidar';
 import { ReminderManager, formatTime } from './reminders.js';
+import { initGoogleCalendar, authorizeWithCode, isCalendarReady } from './google-calendar.js';
 import type { TaskDefinition } from './task-loader.js';
 import type { Config } from './config.js';
 import { ToolExecutor } from './tool-executor.js';
@@ -304,6 +305,7 @@ export function startTelegramBot(config: Config, tasks: TaskDefinition[]): Teleg
     (chatId, text) => bot.sendMessage(chatId, text)
   );
   reminderMgr.setClaudeConfig(config.claude, config.telegramBot.defaultWorkdir);
+  reminderMgr.setFullConfig(config, config.telegramBot.defaultWorkdir, baseMemoryDir);
   reminderMgr.startAll();
 
   const logDir = config.logging.dir;
@@ -382,7 +384,9 @@ export function startTelegramBot(config: Config, tasks: TaskDefinition[]): Teleg
     // openai 프로바이더일 때 에이전트 모드용 ToolExecutor 생성
     let toolExecutor: ToolExecutor | undefined;
     if (currentProvider === 'openai' && config.memory?.enabled) {
-      toolExecutor = new ToolExecutor([userMemDir, path.dirname(remindersPath)]);
+      const workdir = config.telegramBot.defaultWorkdir || process.cwd();
+      toolExecutor = new ToolExecutor([userMemDir, path.dirname(remindersPath), workdir]);
+      toolExecutor.setWorkdir(workdir);
     }
 
     // 프로바이더별 memoryPrefix 분기
@@ -661,8 +665,77 @@ export function startTelegramBot(config: Config, tasks: TaskDefinition[]): Teleg
       return;
     }
 
+    // /gcal 명령: Google Calendar 인증 및 상태 확인
+    if (text === '/gcal' || text.startsWith('/gcal ')) {
+      const arg = text.replace(/^\/gcal\s*/, '').trim();
+
+      if (!arg) {
+        // 상태 표시
+        const ready = isCalendarReady();
+        const status = ready ? '연결됨' : '미연결';
+        let msg = `Google Calendar: ${status}\n\n`;
+        if (!ready) {
+          msg += '인증 방법:\n';
+          msg += '1. /gcal auth - 인증 URL 생성\n';
+          msg += '2. URL을 브라우저에서 열고 코드 복사\n';
+          msg += '3. /gcal code <인증코드> - 코드 입력';
+        }
+        await bot.sendMessage(chatId, msg);
+        return;
+      }
+
+      if (arg === 'auth') {
+        // 인증 URL 생성/표시
+        if (isCalendarReady()) {
+          await bot.sendMessage(chatId, 'Google Calendar가 이미 연결되어 있습니다.');
+          return;
+        }
+        try {
+          const rawCredFile = config.googleCalendar?.credentialsFile || 'config/google-credentials.json';
+          const credFile = path.isAbsolute(rawCredFile)
+            ? rawCredFile
+            : path.resolve(config.telegramBot.defaultWorkdir || '.', rawCredFile);
+          const result = await initGoogleCalendar(credFile);
+          if (result.ready) {
+            await bot.sendMessage(chatId, 'Google Calendar가 이미 연결되어 있습니다.');
+          } else if (result.authUrl) {
+            await bot.sendMessage(chatId,
+              '아래 URL을 브라우저에서 열어 인증하세요:\n\n' +
+              result.authUrl + '\n\n' +
+              '인증 후 받은 코드를 /gcal code <코드> 로 입력하세요.'
+            );
+          }
+        } catch (err: any) {
+          await bot.sendMessage(chatId, `Google Calendar 초기화 실패: ${err.message}`);
+        }
+        return;
+      }
+
+      if (arg.startsWith('code ')) {
+        const code = arg.replace(/^code\s+/, '').trim();
+        if (!code) {
+          await bot.sendMessage(chatId, '사용법: /gcal code <인증코드>');
+          return;
+        }
+        try {
+          const success = await authorizeWithCode(code);
+          if (success) {
+            await bot.sendMessage(chatId, 'Google Calendar 연결 완료! 이제 일정을 관리할 수 있습니다.');
+          } else {
+            await bot.sendMessage(chatId, '인증에 실패했습니다. 코드가 올바른지 확인해주세요.');
+          }
+        } catch (err: any) {
+          await bot.sendMessage(chatId, `인증 실패: ${err.message}`);
+        }
+        return;
+      }
+
+      await bot.sendMessage(chatId, '사용법:\n/gcal - 상태 확인\n/gcal auth - 인증 시작\n/gcal code <코드> - 인증 코드 입력');
+      return;
+    }
+
     if (text === '/start') {
-      await bot.sendMessage(chatId, 'Claude Cron Bot\n\n/ask <질문> - Claude에게 질문\n/alarm <시간+내용> - 알람 등록\n/alarms - 알람 목록\n/delalarm <번호> - 알람 삭제\n/run <task-id> - 태스크 실행\n/tasks - 태스크 목록\n/new - 새 대화\n/status - 세션 상태\n/model - 모델 선택 (Claude/ChatGPT)\n\n또는 그냥 메시지를 보내세요.');
+      await bot.sendMessage(chatId, 'Claude Cron Bot\n\n/ask <질문> - Claude에게 질문\n/alarm <시간+내용> - 알람 등록\n/alarms - 알람 목록\n/delalarm <번호> - 알람 삭제\n/gcal - Google Calendar 연결\n/run <task-id> - 태스크 실행\n/tasks - 태스크 목록\n/new - 새 대화\n/status - 세션 상태\n/model - 모델 선택 (Claude/ChatGPT)\n\n또는 그냥 메시지를 보내세요.');
       return;
     }
 

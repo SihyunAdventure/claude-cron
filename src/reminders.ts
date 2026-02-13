@@ -2,7 +2,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import cron from 'node-cron';
 import { executeClaudeTask } from './executor.js';
-import type { ClaudeConfig } from './config.js';
+import { executeTask as executeUnifiedTask } from './unified-executor.js';
+import type { ClaudeConfig, Config } from './config.js';
+import { ToolExecutor } from './tool-executor.js';
 
 export interface Reminder {
   id: string;
@@ -112,7 +114,9 @@ export class ReminderManager {
   private scheduledJobs: Map<string, cron.ScheduledTask> = new Map();
   private sendFn: (chatId: number, text: string) => Promise<void>;
   private claudeConfig: ClaudeConfig | null = null;
+  private fullConfig: Config | null = null;
   private defaultWorkdir: string | undefined;
+  private memoryDir: string | undefined;
 
   constructor(sendFn: (chatId: number, text: string) => Promise<void>) {
     this.sendFn = sendFn;
@@ -122,6 +126,12 @@ export class ReminderManager {
   setClaudeConfig(config: ClaudeConfig, workdir?: string): void {
     this.claudeConfig = config;
     this.defaultWorkdir = workdir;
+  }
+
+  setFullConfig(config: Config, workdir?: string, memoryDir?: string): void {
+    this.fullConfig = config;
+    this.defaultWorkdir = workdir;
+    this.memoryDir = memoryDir;
   }
 
   startAll(): void {
@@ -136,16 +146,40 @@ export class ReminderManager {
   private scheduleJob(r: Reminder): void {
     const job = cron.schedule(r.cron, async () => {
       try {
-        if (r.type === 'task' && this.claudeConfig) {
-          const result = await executeClaudeTask(
-            {
-              prompt: r.message + '\n\n[주의: 마크다운 문법(**bold**, __italic__ 등) 사용 금지. 플레인 텍스트와 이모지만 사용하라.]',
-              workdir: r.workdir || this.defaultWorkdir,
-              timeout: 300000,
-            },
-            this.claudeConfig
-          );
-          await this.sendFn(r.chatId, result.output || '(결과 없음)');
+        if (r.type === 'task') {
+          const taskPrompt = r.message + '\n\n[주의: 마크다운 문법(**bold**, __italic__ 등) 사용 금지. 플레인 텍스트와 이모지만 사용하라.]';
+
+          // ChatGPT Browser (unified executor) 우선 사용
+          if (this.fullConfig) {
+            const workdir = r.workdir || this.defaultWorkdir;
+            const toolExecutor = new ToolExecutor(
+              [workdir || process.cwd(), this.memoryDir || ''].filter(Boolean),
+            );
+            if (workdir) toolExecutor.setWorkdir(workdir);
+
+            const result = await executeUnifiedTask(
+              {
+                prompt: taskPrompt,
+                workdir,
+                timeout: 300000,
+                provider: 'openai',
+                toolExecutor,
+              },
+              this.fullConfig,
+            );
+            await this.sendFn(r.chatId, result.output || '(결과 없음)');
+          } else if (this.claudeConfig) {
+            // fallback: Claude CLI
+            const result = await executeClaudeTask(
+              {
+                prompt: taskPrompt,
+                workdir: r.workdir || this.defaultWorkdir,
+                timeout: 300000,
+              },
+              this.claudeConfig,
+            );
+            await this.sendFn(r.chatId, result.output || '(결과 없음)');
+          }
         } else {
           await this.sendFn(r.chatId, `⏰ ${r.message}`);
         }

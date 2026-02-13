@@ -35,6 +35,12 @@ chatgptBrowser:
   headless: true     # cf_clearance 쿠키가 user-data-dir에 캐시되어 headless 가능
   cdpPort: 19222
 
+# Google Calendar: Desktop OAuth 방식으로 일정 관리
+# 사전 준비: Google Cloud Console → OAuth 2.0 Client ID (Desktop) → credentials.json 다운로드
+googleCalendar:
+  enabled: true
+  credentialsFile: ./config/google-credentials.json
+
 # Default provider: 'claude' or 'openai'
 # openai 선택 시 chatgptBrowser → openclawGateway → codex CLI 순으로 fallback
 defaultProvider: openai

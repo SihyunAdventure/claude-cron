@@ -70,6 +70,9 @@ export async function executeClaudeTask(
       maxBuffer: 10 * 1024 * 1024,
       env: {
         ...process.env,
+        // Claude Code 중첩 세션 방지 해제
+        // 서버가 Claude Code 내에서 실행될 때도 CLI 호출 가능하도록
+        CLAUDECODE: undefined,
         // Use default ~/.claude config (shares Max Plan login session)
         ...(process.env.CLAUDE_CRON_CONFIG_DIR && {
           CLAUDE_CONFIG_DIR: process.env.CLAUDE_CRON_CONFIG_DIR,
