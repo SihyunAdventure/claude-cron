@@ -38,8 +38,8 @@ export class ToolExecutor {
 
   constructor(
     private allowedPaths: string[], // 허용된 기본 경로 배열
-    private maxReadSize: number = 10240, // 최대 읽기 크기 (10KB)
-    private maxWriteSize: number = 5120, // 최대 쓰기 크기 (5KB)
+    private maxReadSize: number = 51200, // 최대 읽기 크기 (50KB)
+    private maxWriteSize: number = 10240, // 최대 쓰기 크기 (10KB)
   ) {}
 
   /** Bash 실행 시 사용할 작업 디렉토리 설정 */
@@ -367,6 +367,16 @@ export class ToolExecutor {
     // '..' 포함 여부 확인
     if (requestedPath.includes('..')) {
       throw new Error(`경로에 '..'를 포함할 수 없습니다: ${requestedPath}`);
+    }
+
+    // 민감한 파일 접근 차단
+    const sensitivePatterns = [
+      'token.json', '.env', 'credentials.json', 'auth.json',
+      '.claude-cron/google-calendar-token', 'client_secret',
+    ];
+    const lower = requestedPath.toLowerCase();
+    if (sensitivePatterns.some((p) => lower.includes(p))) {
+      throw new Error(`민감한 파일에 접근할 수 없습니다: ${requestedPath}`);
     }
 
     // 절대 경로인 경우 바로 검증

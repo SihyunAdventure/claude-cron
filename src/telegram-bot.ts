@@ -272,6 +272,57 @@ function getInlinedMemoryContent(baseMemoryDir: string, chatId: number): string 
   return sections.join('\n\n');
 }
 
+/**
+ * 최근 대화 N개를 JSONL 로그에서 읽어 인라인 문자열로 반환합니다.
+ * 에이전트가 이전 맥락을 이해할 수 있도록 프롬프트에 포함됩니다.
+ */
+function getRecentConversation(logDir: string, chatId: number, maxEntries: number = 6): string {
+  const logFile = path.join(logDir, `chat-${chatId}.jsonl`);
+  if (!fs.existsSync(logFile)) return '';
+
+  try {
+    const content = fs.readFileSync(logFile, 'utf-8').trim();
+    if (!content) return '';
+
+    const lines = content.split('\n');
+    // 최근 N개만 사용
+    const recent = lines.slice(-maxEntries);
+
+    const entries: string[] = [];
+    for (const line of recent) {
+      try {
+        const entry = JSON.parse(line);
+        if (!entry.prompt || !entry.response) continue;
+
+        // 프롬프트에서 메모리 프리픽스 제거 (불필요한 반복 방지)
+        let userMsg = entry.prompt;
+        const memIdx = userMsg.indexOf('\n\n[메모리 시스템]');
+        if (memIdx > 0) userMsg = userMsg.slice(0, memIdx);
+        // 인라인 메모리도 제거
+        const inlineIdx = userMsg.indexOf('[현재 메모리]');
+        if (inlineIdx >= 0) {
+          const afterInline = userMsg.indexOf('\n\n', inlineIdx + 50);
+          if (afterInline > 0) userMsg = userMsg.slice(afterInline).trim();
+        }
+
+        // 너무 긴 메시지는 잘라냄
+        const maxLen = 300;
+        const userShort = userMsg.length > maxLen ? userMsg.slice(0, maxLen) + '...' : userMsg;
+        const botShort = entry.response.length > maxLen ? entry.response.slice(0, maxLen) + '...' : entry.response;
+
+        entries.push(`사용자: ${userShort}\n봇: ${botShort}`);
+      } catch {
+        // 파싱 실패 무시
+      }
+    }
+
+    if (entries.length === 0) return '';
+    return `[최근 대화]\n${entries.join('\n\n')}\n\n`;
+  } catch {
+    return '';
+  }
+}
+
 function appendDailyLog(userMemoryDir: string, prompt: string, response: string): void {
   const dateStr = getTodayDateStr();
   const logFile = path.join(userMemoryDir, 'daily', `${dateStr}.md`);
@@ -415,7 +466,13 @@ export function startTelegramBot(config: Config, tasks: TaskDefinition[]): Teleg
     }
 
     const memoryPrefix = isAgent
-      ? `${inlinedMemory ? `[현재 메모리]\n${inlinedMemory}\n\n` : ''}[메모리 시스템]
+      ? `${inlinedMemory ? `[현재 메모리]\n${inlinedMemory}\n\n` : ''}[중요: 도구 사용 규칙]
+- 제공된 도구(calendar_list_events, calendar_create_event, web_search, bash 등)를 직접 호출하라
+- 소스 코드(.ts 파일)를 읽어서 시스템 구조를 파악하려 하지 마라. 도구 설명만으로 충분하다
+- 불필요한 파일 탐색(list_dir, search_files)을 최소화하고 사용자 요청에 집중하라
+- 도구 호출은 최소한으로. 같은 도구를 같은 파라미터로 반복 호출하지 마라
+
+[메모리 시스템]
 경로: ${userMemDir}
 - 위 [현재 메모리]에 이미 코어 파일 내용이 포함되어 있으므로 다시 읽을 필요 없음
 - 추가 정보 필요 시: ${userMemDir}/areas/work.md, ${userMemDir}/areas/health.md 등을 read_file로 읽기
@@ -463,9 +520,12 @@ export function startTelegramBot(config: Config, tasks: TaskDefinition[]): Teleg
       }
     };
 
+    // 최근 대화 히스토리 로드 (이전 맥락 이해용)
+    const recentConvo = getRecentConversation(logDir, chatId, 15);
+
     let result = await executeTask(
       {
-        prompt: memoryPrefix + prompt,
+        prompt: recentConvo + memoryPrefix + prompt,
         workdir: config.telegramBot.defaultWorkdir,
         systemPrompt: getSystemPrompt(chatId),
         sessionId: existingSessionId || undefined,
@@ -488,7 +548,7 @@ export function startTelegramBot(config: Config, tasks: TaskDefinition[]): Teleg
       // 재시도 시 onProgress 제거하여 중복 메시지 방지
       result = await executeTask(
         {
-          prompt: memoryPrefix + prompt,
+          prompt: recentConvo + memoryPrefix + prompt,
           workdir: config.telegramBot.defaultWorkdir,
           systemPrompt: getSystemPrompt(chatId),
           provider: currentProvider,
