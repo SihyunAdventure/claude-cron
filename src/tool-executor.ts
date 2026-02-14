@@ -254,6 +254,11 @@ export class ToolExecutor {
                 type: 'string',
                 description: '장소 (선택)',
               },
+              attendees: {
+                type: 'array',
+                items: { type: 'string' },
+                description: '참석자 이메일 배열 (선택). 예: ["abc@gmail.com", "def@company.com"]',
+              },
             },
             required: ['summary', 'start'],
             additionalProperties: false,
@@ -327,6 +332,7 @@ export class ToolExecutor {
             end: args.end,
             description: args.description,
             location: args.location,
+            attendees: args.attendees,
           });
           break;
         case 'calendar_delete_event':

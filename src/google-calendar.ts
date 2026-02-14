@@ -35,6 +35,7 @@ export interface CalendarEvent {
   end?: string;
   location?: string;
   allDay?: boolean;
+  attendees?: string[]; // 참석자 이메일 배열
 }
 
 let oAuth2Client: OAuth2Client | null = null;
@@ -224,12 +225,16 @@ export async function createEvent(event: CalendarEvent): Promise<string> {
 
     const res = await calendarApi.events.insert({
       calendarId: 'primary',
+      sendUpdates: event.attendees?.length ? 'all' : 'none',
       requestBody: {
         summary: event.summary,
         description: event.description,
         location: event.location,
         start: startObj,
         end: endObj,
+        ...(event.attendees?.length && {
+          attendees: event.attendees.map((email) => ({ email })),
+        }),
       },
     });
 
@@ -290,9 +295,14 @@ export async function updateEvent(
       }
     }
 
+    if (updates.attendees) {
+      body.attendees = updates.attendees.map((email) => ({ email }));
+    }
+
     const res = await calendarApi.events.update({
       calendarId: 'primary',
       eventId,
+      sendUpdates: updates.attendees?.length ? 'all' : 'none',
       requestBody: body,
     });
 
