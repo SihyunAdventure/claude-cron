@@ -18,7 +18,7 @@ import os from 'node:os';
 import fs from 'node:fs';
 import { chromium, type Browser, type Page } from 'playwright-core';
 
-/** Chrome 실행 시 사용할 기본 포트 (OpenClaw의 18800-18899와 충돌 회피) */
+/** Chrome 실행 시 사용할 기본 CDP 디버깅 포트 */
 const DEFAULT_CDP_PORT = 19222;
 
 /** 브라우저 사용자 데이터 디렉토리 (Cloudflare 세션 유지) */

@@ -674,13 +674,12 @@ export function startTelegramBot(config: Config, tasks: TaskDefinition[]): Teleg
       if (!arg) {
         // 현재 상태 표시
         const current = providerStore.get(chatId) || config.defaultProvider || 'claude';
-        const openaiStatus = config.openai?.enabled ? '활성화' : '비활성화';
-        const gatewayNote = config.openclawGateway?.enabled ? ' (Gateway 활성화)' : '';
+        const openaiStatus = config.chatgptBrowser?.enabled ? '활성화' : (config.openai?.enabled ? '활성화 (Codex CLI)' : '비활성화');
         await bot.sendMessage(chatId,
           `현재 모델: ${current}\n\n` +
           `사용 가능한 모델:\n` +
           `- claude: Claude CLI (기본)\n` +
-          `- openai: ChatGPT (${openaiStatus})${gatewayNote}\n\n` +
+          `- openai: ChatGPT (${openaiStatus})\n\n` +
           `전환: /model claude 또는 /model openai`
         );
         return;
@@ -693,16 +692,15 @@ export function startTelegramBot(config: Config, tasks: TaskDefinition[]): Teleg
       }
 
       if (arg === 'openai' || arg === 'chatgpt' || arg === 'gpt') {
-        if (!config.openai?.enabled && !config.openclawGateway?.enabled && !config.chatgptBrowser?.enabled) {
+        if (!config.openai?.enabled && !config.chatgptBrowser?.enabled) {
           await bot.sendMessage(chatId,
             'OpenAI가 비활성화 상태입니다.\n' +
-            'config.yaml에서 chatgptBrowser.enabled, openai.enabled, 또는 openclawGateway.enabled를 true로 설정하세요.'
+            'config.yaml에서 chatgptBrowser.enabled 또는 openai.enabled를 true로 설정하세요.'
           );
           return;
         }
         providerStore.set(chatId, 'openai');
-        const method = config.chatgptBrowser?.enabled ? 'Browser' :
-          config.openclawGateway?.enabled ? 'Gateway' : 'Codex CLI';
+        const method = config.chatgptBrowser?.enabled ? 'Browser' : 'Codex CLI';
         await bot.sendMessage(chatId, `ChatGPT (${method})로 전환했습니다.`);
         return;
       }

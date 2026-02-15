@@ -17,7 +17,6 @@
  * - 모델이 function_call → 로컬 도구 실행 → 결과 반환 → 반복
  *
  * 인터페이스: sendMessage(message) → { text, durationMs, model }
- *            (openclaw-gateway.ts와 동일 시그니처)
  */
 
 import fs from 'node:fs';

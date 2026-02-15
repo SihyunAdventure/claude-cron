@@ -16,17 +16,8 @@ openai:
   maxTokens: 16384
   defaultTimeout: 300000
 
-# OpenClaw Gateway: WebSocket으로 게이트웨이에 직접 연결 (가장 빠름, ~2-4초)
-# Cloudflare bypass를 게이트웨이가 처리하므로 직접 API 호출 불필요
-openclawGateway:
-  enabled: true
-  url: ws://localhost:18789
-  token: ${OPENCLAW_GATEWAY_TOKEN}
-  sessionId: claude-cron-default
-  timeout: 30000
-
 # ChatGPT Browser: Playwright + 실제 Chrome으로 Cloudflare 자체 우회
-# OpenClaw 게이트웨이 의존 없이 직접 ChatGPT API 호출 (2-5초)
+# 직접 ChatGPT API 호출 (2-5초)
 chatgptBrowser:
   enabled: true
   model: gpt-5.3-codex-spark
@@ -42,7 +33,7 @@ googleCalendar:
   credentialsFile: ./config/google-credentials.json
 
 # Default provider: 'claude' or 'openai'
-# openai 선택 시 chatgptBrowser → openclawGateway → codex CLI 순으로 fallback
+# openai 선택 시 chatgptBrowser → codex CLI 순으로 fallback
 defaultProvider: openai
 
 memory:
