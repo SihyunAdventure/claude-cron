@@ -12,11 +12,42 @@ import { watch } from 'chokidar';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
+import os from 'node:os';
+import { syncCodexAuth } from './codex-auth-sync.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.resolve(__dirname, '..');
 
 const LOCK_FILE = '/tmp/claude-cron.lock';
+
+function syncCodexAuthFromConfig() {
+  const sourcePath =
+    process.env.CODEX_AUTH_SOURCE || path.resolve(PROJECT_ROOT, 'config', 'codex-auth.json');
+  const targetPath =
+    process.env.CODEX_AUTH_TARGET ||
+    path.resolve(os.homedir(), '.codex', 'auth.json');
+
+  const result = syncCodexAuth({ sourcePath, targetPath });
+  if (result.status === 'failed') {
+    console.warn(`[codex-auth] sync failed: ${result.reason}`);
+  } else if (result.status === 'skipped') {
+    console.log(`[codex-auth] sync skipped: ${result.reason}`);
+  } else {
+    console.log(`[codex-auth] sync: ${result.reason}`);
+  }
+}
+
+function startCodexAuthSyncScheduler() {
+  const rawIntervalMinutes = Number(process.env.CODEX_AUTH_SYNC_INTERVAL_MINUTES || '0');
+  if (!Number.isFinite(rawIntervalMinutes) || rawIntervalMinutes <= 0) {
+    return;
+  }
+
+  const intervalMs = rawIntervalMinutes * 60 * 1000;
+  setInterval(() => {
+    syncCodexAuthFromConfig();
+  }, intervalMs);
+}
 
 function acquireLock(): boolean {
   try {
@@ -55,6 +86,9 @@ async function main() {
   if (!acquireLock()) {
     process.exit(1);
   }
+
+  syncCodexAuthFromConfig();
+  startCodexAuthSyncScheduler();
 
   // Load config
   const config = loadConfig();

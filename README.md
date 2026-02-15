@@ -57,6 +57,29 @@ npm run build
 npm start
 ```
 
+## Codex OAuth 토큰 동기화
+
+서비스 시작 시 `config/codex-auth.json`을 `~/.codex/auth.json`로 자동 반영할 수 있습니다.
+
+- 기본 동작: 서비스 부팅 시 1회 동기화
+- 설정값(환경변수):
+  - `CODEX_AUTH_SOURCE` (기본: `config/codex-auth.json`)
+  - `CODEX_AUTH_TARGET` (기본: `~/.codex/auth.json`)
+  - `CODEX_AUTH_SYNC_INTERVAL_MINUTES` (기본: `0`, 1 이상 입력 시 주기 동기화)
+
+예시:
+
+```env
+CODEX_AUTH_SOURCE=config/codex-auth.json
+CODEX_AUTH_TARGET=~/.codex/auth.json
+CODEX_AUTH_SYNC_INTERVAL_MINUTES=0
+```
+
+동기화 정책:
+- source/target JSON이 유효한 auth payload일 때만 반영
+- target 파일의 `last_refresh` 또는 파일 수정 시각이 source보다 최신이면 덮어쓰지 않음
+- 덮어쓰기 시 `chmod 600`으로 보호 설정
+
 ## 요구사항
 
 - Node.js 22+
